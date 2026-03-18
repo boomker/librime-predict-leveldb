@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make clang-format-lint:*)",
+      "Bash(make clang-format-apply:*)",
+      "Bash(xargs clang-format:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
+    ]
+  }
+}
