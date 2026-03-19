@@ -5,6 +5,7 @@
 #include <rime/service.h>
 #include <rime/schema.h>
 #include <rime/deployer.h>
+#include <rime/switcher.h>
 #include "predict_engine.h"
 
 namespace fs = std::filesystem;
@@ -14,6 +15,59 @@ namespace rime {
 static const string predict_snapshot_extension = ".txt";
 
 static const ResourceType kPredictDbResourceType = {"level_predict_db", "", ""};
+
+static string GetUserPredictDbName(Config* config) {
+  if (!config) {
+    return "predict.userdb";
+  }
+
+  string level_db_name = "predict.userdb";
+  string db_name;
+  if (!config->GetString("predictor/predictdb", &level_db_name)) {
+    if (config->GetString("predictor/db", &db_name) &&
+        boost::ends_with(db_name, ".userdb")) {
+      level_db_name = db_name;
+    }
+  }
+  return level_db_name;
+}
+
+static int GetDeletedRecordExpireDays(const string& db_name) {
+  the<Config> default_config(Config::Require("config")->Create("default"));
+  if (!default_config) {
+    return 0;
+  }
+
+  int expire_days = 0;
+  bool found = false;
+  Switcher::ForEachSchemaListEntry(
+      default_config.get(),
+      [&db_name, &expire_days, &found](const string& schema_id) {
+        Schema schema(schema_id);
+        Config* config = schema.config();
+        if (!config) {
+          return true;
+        }
+        if (GetUserPredictDbName(config) != db_name) {
+          return true;
+        }
+
+        int schema_expire_days = 0;
+        config->GetInt("predictor/deleted_record_expire_days",
+                       &schema_expire_days);
+        if (!found) {
+          expire_days = schema_expire_days;
+          found = true;
+        } else if (schema_expire_days != expire_days) {
+          // Prefer the least destructive retention window when multiple
+          // schemas share the same predict userdb.
+          expire_days = std::max(expire_days, schema_expire_days);
+        }
+        return true;
+      });
+
+  return expire_days;
+}
 
 static bool SyncPredictDb(Deployer* deployer, const string& db_name) {
   LOG(INFO) << "syncing predict db: " << db_name;
@@ -44,6 +98,7 @@ static bool SyncPredictDb(Deployer* deployer, const string& db_name) {
     }
   }
   string snapshot_file = db_name + predict_snapshot_extension;
+  const int deleted_record_expire_days = GetDeletedRecordExpireDays(db_name);
 
   // 合并旧版快照
   path legacy_snapshot = sync_dir / snapshot_file;
@@ -85,7 +140,7 @@ static bool SyncPredictDb(Deployer* deployer, const string& db_name) {
 
   // 备份当前状态
   path backup_path = backup_dir / snapshot_file;
-  if (!predict_db->Backup(backup_path)) {
+  if (!predict_db->Backup(backup_path, deleted_record_expire_days)) {
     LOG(ERROR) << "backup failed: " << backup_path;
     success = false;
   } else {

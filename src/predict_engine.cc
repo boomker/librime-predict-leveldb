@@ -46,9 +46,9 @@ static bool DecodePredictions(const string& value,
     unpacked.get().convert(*predict);
     return true;
   } catch (const std::exception& ex) {
-    DLOG(INFO) << "failed to decode as new format msgpack: " << ex.what();
+    // 解码失败，尝试旧格式
   } catch (...) {
-    DLOG(INFO) << "failed to decode as new format msgpack.";
+    // 解码失败，尝试旧格式
   }
 
   // 尝试解码为旧格式（2 字段）msgpack
@@ -64,13 +64,12 @@ static bool DecodePredictions(const string& value,
     }
 
     if (!predict->empty()) {
-      LOG(INFO) << "decoded predict db entry using legacy msgpack format.";
       return true;
     }
   } catch (const std::exception& ex) {
-    DLOG(INFO) << "failed to decode as legacy msgpack: " << ex.what();
+    // 解码失败，尝试文本格式
   } catch (...) {
-    DLOG(INFO) << "failed to decode as legacy msgpack.";
+    // 解码失败，尝试文本格式
   }
 
   // 最后尝试旧的文本格式
@@ -94,7 +93,6 @@ static bool DecodePredictions(const string& value,
   }
 
   if (!predict->empty()) {
-    LOG(INFO) << "decoded predict db entry using legacy text fallback.";
     return true;
   }
   return false;
@@ -223,15 +221,11 @@ an<PredictDb> PredictDbManager::GetPredictDb(const path& file_path) {
   auto found = db_cache_.find(file_path.string());
   if (found != db_cache_.end()) {
     if (auto db = found->second.lock()) {
-      LOG(INFO) << "Using cached PredictDb for: " << file_path;
       return db;
     } else {
-      LOG(INFO) << "Cached PredictDb for " << file_path
-                << " has expired, creating a new one.";
       db_cache_.erase(found);
     }
   }
-  LOG(INFO) << "Creating new PredictDb for: " << file_path;
   an<PredictDb> new_db = std::make_shared<PredictDb>(file_path);
   if (new_db->valid()) {
     db_cache_[file_path.string()] = new_db;
@@ -243,22 +237,29 @@ an<PredictDb> PredictDbManager::GetPredictDb(const path& file_path) {
 }
 
 PredictEngine::PredictEngine(an<PredictDb> level_db,
+                             an<LegacyPredictDb> fallback_db,
                              int max_iterations,
-                             int max_candidates)
+                             int max_candidates,
+                             int deleted_record_expire_days)
     : level_db_(level_db),
+      fallback_db_(fallback_db),
       max_iterations_(max_iterations),
-      max_candidates_(max_candidates) {}
+      max_candidates_(max_candidates),
+      deleted_record_expire_days_(deleted_record_expire_days) {}
 
 PredictEngine::~PredictEngine() {}
 
 bool PredictEngine::Predict(Context* ctx, const string& context_query) {
-  DLOG(INFO) << "PredictEngine::Predict [" << context_query << "]";
-  if (!level_db_) {
+  if (!level_db_ && !fallback_db_) {
     return false;
   }
-  if (level_db_->Lookup(context_query)) {
+  if (level_db_ && level_db_->Lookup(context_query)) {
     query_ = context_query;
     candidates_ = level_db_->candidates();
+    return true;
+  }
+  if (fallback_db_ && fallback_db_->Lookup(context_query, &candidates_)) {
+    query_ = context_query;
     return true;
   } else {
     Clear();
@@ -306,31 +307,57 @@ PredictEngineComponent::~PredictEngineComponent() {}
 
 PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
   string level_db_name = "predict.userdb";
+  string fallback_db_name = "predict.db";
+  string db_name;
   int max_candidates = 0;
   int max_iterations = 0;
+  int deleted_record_expire_days = 0;  // 默认 0（永不清理）
   if (auto* schema = ticket.schema) {
     auto* config = schema->config();
-    if (config->GetString("predictor/db", &level_db_name)) {
-      LOG(INFO) << "custom predictor/db: " << level_db_name;
-    } else if (config->GetString("predictor/predictdb", &level_db_name)) {
-      LOG(INFO) << "custom predictor/predictdb: " << level_db_name;
+    if (!config->GetString("predictor/predictdb", &level_db_name)) {
+      if (config->GetString("predictor/db", &db_name)) {
+        if (boost::ends_with(db_name, ".userdb")) {
+          level_db_name = db_name;
+        } else {
+          fallback_db_name = db_name;
+        }
+      }
+    } else {
+      config->GetString("predictor/db", &db_name);
+      if (!db_name.empty() && !boost::ends_with(db_name, ".userdb")) {
+        fallback_db_name = db_name;
+      }
     }
-    if (!config->GetInt("predictor/max_candidates", &max_candidates)) {
-      LOG(INFO) << "predictor/max_candidates is not set in schema";
-    }
-    if (!config->GetInt("predictor/max_iterations", &max_iterations)) {
-      LOG(INFO) << "predictor/max_iterations is not set in schema";
-    }
+    config->GetString("predictor/fallback_db", &fallback_db_name);
+    config->GetInt("predictor/max_candidates", &max_candidates);
+    config->GetInt("predictor/max_iterations", &max_iterations);
+    config->GetInt("predictor/deleted_record_expire_days",
+                   &deleted_record_expire_days);
   }
 
   the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
       kPredictDbPredictDbResourceType));
   auto file_path = resolver->ResolvePath(level_db_name);
   an<PredictDb> level_db = PredictDbManager::instance().GetPredictDb(file_path);
+  an<LegacyPredictDb> fallback_db;
+  if (!fallback_db_name.empty()) {
+    static const ResourceType kPredictDbResourceType = {"predict_db", "", ""};
+    the<ResourceResolver> fallback_resolver(
+        Service::instance().CreateResourceResolver(kPredictDbResourceType));
+    auto fallback_path = fallback_resolver->ResolvePath(fallback_db_name);
+    fallback_db =
+        LegacyPredictDbManager::instance().GetPredictDb(fallback_path);
+  }
 
   if (level_db && level_db->valid()) {
-    return new PredictEngine(level_db, max_iterations, max_candidates);
-  } else {
+    return new PredictEngine(level_db, fallback_db, max_iterations,
+                             max_candidates, deleted_record_expire_days);
+  }
+  if (fallback_db && fallback_db->valid()) {
+    return new PredictEngine(level_db, fallback_db, max_iterations,
+                             max_candidates, deleted_record_expire_days);
+  }
+  {
     LOG(ERROR) << "failed to load predict db: " << level_db_name;
   }
 
@@ -386,6 +413,10 @@ bool PredictDb::Lookup(const string& query) {
 
   Clear();
   for (const auto& entry : predict) {
+    // 过滤掉已删除的记录（commits < 0）
+    if (entry.commits < 0) {
+      continue;
+    }
     candidates_.push_back(entry.word);
   }
   return true;
@@ -422,14 +453,22 @@ void PredictDb::UpdatePredict(const string& key,
     }
 
     if (todelete) {
-      predict.erase(
-          std::remove_if(predict.begin(), predict.end(),
-                         [&](Prediction& p) { return p.word == word; }),
-          predict.end());
-      found = true;
+      // 标记为已删除：将 commits 设为负值（与 schema 级用户词行为一致）
+      for (auto& entry : predict) {
+        if (entry.word == word) {
+          entry.commits = std::min(-1, -std::abs(entry.commits));
+          entry.dee = 0.0;
+          entry.tick = current_tick;
+          found = true;
+        }
+      }
     } else {
       for (auto& entry : predict) {
         if (entry.word == word) {
+          // 如果是已删除的记录（commits < 0），恢复它
+          if (entry.commits < 0) {
+            entry.commits = -entry.commits;
+          }
           entry.count += 1.0 / (total_count + 1.0);
           entry.commits += 1;
           entry.dee = entry.count;
@@ -462,7 +501,8 @@ void PredictDb::UpdatePredict(const string& key,
   }
 }
 
-bool PredictDb::Backup(const path& snapshot_file) {
+bool PredictDb::Backup(const path& snapshot_file,
+                       int deleted_record_expire_days) {
   std::shared_lock<std::shared_mutex> lock(rw_mutex_);  // 读锁
   LOG(INFO) << "backing up predict db to " << snapshot_file;
   std::ofstream out(snapshot_file.string());
@@ -474,13 +514,13 @@ bool PredictDb::Backup(const path& snapshot_file) {
   string db_name = snapshot_file.stem().u8string();
   string db_type = "userdb";
   string rime_version = RIME_VERSION;
-  string tick = "1";
+  uint64_t current_time = static_cast<uint64_t>(std::time(nullptr));
+  string tick = std::to_string(current_time);  // 使用当前时间戳
   string user_id = snapshot_file.parent_path().filename().u8string();
 
   ReadDbTextValue(db_, "\x01/db_name", db_name, &db_name);
   ReadDbTextValue(db_, "\x01/db_type", db_type, &db_type);
   ReadDbTextValue(db_, "\x01/rime_version", rime_version, &rime_version);
-  ReadDbTextValue(db_, "\x01/tick", tick, &tick);
   ReadDbTextValue(db_, "\x01/user_id", user_id, &user_id);
 
   out << "# Rime user dictionary\n";
@@ -489,6 +529,11 @@ bool PredictDb::Backup(const path& snapshot_file) {
   out << "#@/rime_version\t" << rime_version << "\n";
   out << "#@/tick\t" << tick << "\n";
   out << "#@/user_id\t" << user_id << "\n";
+
+  // 用于计算已删除记录的过期时间
+  const uint64_t expire_seconds =
+      static_cast<uint64_t>(deleted_record_expire_days) * 24 * 3600;
+  const bool enable_expire = (deleted_record_expire_days > 0);
 
   leveldb::Iterator* it = db_->NewIterator(leveldb::ReadOptions());
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
@@ -506,6 +551,11 @@ bool PredictDb::Backup(const path& snapshot_file) {
       continue;
     }
     for (const auto& p : predict) {
+      // 如果启用过期清理，过滤掉已删除且超过指定天数的记录
+      if (enable_expire && p.commits < 0 && p.tick > 0 &&
+          current_time > p.tick && (current_time - p.tick) >= expire_seconds) {
+        continue;
+      }
       out << key << "\t" << p.word << "\tc=" << p.commits << " d=" << p.dee
           << " t=" << p.tick << "\n";
     }

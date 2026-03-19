@@ -1,14 +1,16 @@
 # librime-predict-leveldb
 
-librime plugin. predict next word by commit history.
+中文说明 | [English](README.en.md)
 
-a mod of `rime/librime-predict`
+基于提交历史预测下一个词的 librime 插件。
 
-## Usage
+这是 `rime/librime-predict` 的一个改版，使用 `predict.userdb` 作为可学习用户库，并支持 `predict.db` 作为只读后备预测库。
 
-* In `*.schema.yaml`, add `predictor` to the list of `engine/processors` before `key_binder`,
-  add `predict_translator` to the list of `engine/translators`;
-  or patch the schema with:
+## 用法
+
+1. 在 `*.schema.yaml` 中，把 `predictor` 加到 `engine/processors` 里并放在 `key_binder` 之前，把 `predict_translator` 加到 `engine/translators` 里。
+
+也可以直接用 patch：
 
 ```yaml
 patch:
@@ -16,32 +18,46 @@ patch:
   'engine/translators/@before 0': predict_translator
 ```
 
-* Add the `prediction` switch:
+2. 添加 `prediction` 开关：
 
 ```yaml
 switches:
   - name: prediction
-    states: [ 關閉預測, 開啓預測 ]
+    states: [ 关闭预测, 开启预测 ]
     reset: 1
 ```
 
-* Config items for your predictor:
+3. 配置预测器：
 
 ```yaml
 predictor:
-  # predict db folder in user directory
-  # default to 'predict.userdb'
-  # be careful when there is a schema named `predict`, in which case you should reset value of this `predictdb` key to another name for better compcompliance.
-  predictdb: predict.userdb
-  # max prediction candidates every time
-  # default to 0, which means showing all candidates
-  # you may set it the same with page_size so that period doesn't trigger next page
+  # 用户预测库目录，位于 user data 目录下
+  # 默认值为 'predict.userdb'
+  db: predict.userdb
+  # 静态后备预测库，位于 user/shared data 目录下
+  # 默认值为 'predict.db'
+  # 查询顺序：先查 db，再查 fallback_db
+  fallback_db: predict.db
+  # 每次最多显示多少个预测候选
+  # 默认值为 0，表示显示全部
   max_candidates: 5
-  # max continuous prediction times
-  # default to 0, which means no limitation
+  # 最多连续预测多少次
+  # 默认值为 0，表示不限制
   max_iterations: 1
-  trigger: 'jj'                     # 手动触发弹出预测候选菜单
-  cancel_predict: "/"               # 额外的用于关闭预测菜单按键
+  # 已删除记录在导出到 predict.userdb.txt 时的保留天数
+  # 默认值为 0，表示永不清理
+  deleted_record_expire_days: 90
+  # 手动触发预测菜单的按键序列
+  trigger: 'jj'
+  # 额外的关闭预测菜单按键
+  cancel_predict: '/'
 ```
 
-* Deploy and enjoy.
+补充说明：
+
+- `db` 是可学习的用户库，会记录用户提交和删除行为。
+- `fallback_db` 是只读静态库，仅在 `db` 中查不到当前 key 时作为后备数据源。
+- `deleted_record_expire_days` 只影响导出到 `predict.userdb.txt` 时的已删除记录清理，不会直接从本地 LevelDB 中删除数据。
+- 如果你已有旧版 `predict.db` 数据，可以直接作为 `fallback_db` 使用。
+
+4. 重新部署后即可使用。

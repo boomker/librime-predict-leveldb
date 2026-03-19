@@ -1,6 +1,7 @@
 #ifndef RIME_PREDICT_ENGINE_H_
 #define RIME_PREDICT_ENGINE_H_
 
+#include "predict_legacy_db.h"
 #include <rime/component.h>
 #include <msgpack.hpp>
 #include <leveldb/db.h>
@@ -55,7 +56,7 @@ class PredictDb {
                      bool todelete = false);
 
   // Sync support
-  bool Backup(const path& snapshot_file);
+  bool Backup(const path& snapshot_file, int deleted_record_expire_days = 0);
   bool Restore(const path& snapshot_file);
 
  private:
@@ -67,7 +68,11 @@ class PredictDb {
 
 class PredictEngine : public Class<PredictEngine, const Ticket&> {
  public:
-  PredictEngine(an<PredictDb> level_db, int max_iterations, int max_candidates);
+  PredictEngine(an<PredictDb> level_db,
+                an<LegacyPredictDb> fallback_db,
+                int max_iterations,
+                int max_candidates,
+                int deleted_record_expire_days);
   virtual ~PredictEngine();
 
   bool Predict(Context* ctx, const string& context_query);
@@ -77,27 +82,33 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
 
   int max_iterations() const { return max_iterations_; }
   int max_candidates() const { return max_candidates_; }
+  int deleted_record_expire_days() const { return deleted_record_expire_days_; }
   const string& query() const { return query_; }
   int num_candidates() const { return candidates_.size(); }
   string candidates(size_t i) {
     return candidates_.size() ? candidates_.at(i) : string();
   }
   void UpdatePredict(const string& key, const string& word, bool todelete) {
-    level_db_->UpdatePredict(key, word, todelete);
+    if (level_db_) {
+      level_db_->UpdatePredict(key, word, todelete);
+    }
   }
 
   bool BackupData(const path& snapshot_file) {
-    return level_db_->Backup(snapshot_file);
+    return level_db_ &&
+           level_db_->Backup(snapshot_file, deleted_record_expire_days_);
   }
   bool RestoreData(const path& snapshot_file) {
-    return level_db_->Restore(snapshot_file);
+    return level_db_ && level_db_->Restore(snapshot_file);
   }
 
  private:
   an<PredictDb> level_db_;
-  int max_iterations_;  // prediction times limit
-  int max_candidates_;  // prediction candidate count limit
-  string query_;        // cache last query
+  an<LegacyPredictDb> fallback_db_;
+  int max_iterations_;              // prediction times limit
+  int max_candidates_;              // prediction candidate count limit
+  int deleted_record_expire_days_;  // deleted record expire days
+  string query_;                    // cache last query
   vector<string> candidates_;
 };
 
