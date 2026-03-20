@@ -44,20 +44,26 @@ predictor:
   # Maximum number of continuous prediction steps.
   # Default: 0, which means unlimited.
   max_iterations: 1
+  # When user-db candidates are fewer than this value,
+  # continue filling from fallback_db.
+  # Default: 3
+  min_candidates: 3
   # Retention period in days for deleted records when exporting
   # to predict.userdb.txt. Default: 0, which means never prune.
   deleted_record_expire_days: 90
-  # Key sequence used to trigger the prediction menu manually.
+  # Key sequence used to continue prediction after max_iterations is reached.
   trigger: 'jj'
   # Extra key used to close the prediction menu.
-  cancel_predict: '/'
+  cancel_key: '/'
 ```
 
 Notes:
 
 - `db` is the learnable user database. It records user commits and deletions.
-- `fallback_db` is a read-only static database used only when the current key is not found in `db`.
+- `fallback_db` is a read-only static database. It is used when the current key is not found in `db`, or when `db` returns fewer than `min_candidates` candidates.
 - `deleted_record_expire_days` only affects pruning deleted records during export to `predict.userdb.txt`; it does not remove data directly from the local LevelDB.
 - Existing legacy `predict.db` data can be reused directly as `fallback_db`.
+- `min_candidates` only applies after a user-db hit; user-db candidates stay first, and non-duplicate fallback candidates are appended after them.
+- `trigger` no longer starts the first prediction round manually. When enabled, it only takes effect after automatic prediction has already hit `max_iterations`; typing the sequence continues the next round from the most recent commit without requiring an intermediate normal commit.
 
 4. Deploy and use it.

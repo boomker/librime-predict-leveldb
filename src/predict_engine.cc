@@ -239,11 +239,13 @@ an<PredictDb> PredictDbManager::GetPredictDb(const path& file_path) {
 PredictEngine::PredictEngine(an<PredictDb> level_db,
                              an<LegacyPredictDb> fallback_db,
                              int max_iterations,
+                             int min_candidates,
                              int max_candidates,
                              int deleted_record_expire_days)
     : level_db_(level_db),
       fallback_db_(fallback_db),
       max_iterations_(max_iterations),
+      min_candidates_(min_candidates),
       max_candidates_(max_candidates),
       deleted_record_expire_days_(deleted_record_expire_days) {}
 
@@ -256,6 +258,18 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
   if (level_db_ && level_db_->Lookup(context_query)) {
     query_ = context_query;
     candidates_ = level_db_->candidates();
+    if (fallback_db_ && min_candidates_ > 0 &&
+        static_cast<int>(candidates_.size()) < min_candidates_) {
+      vector<string> fallback_candidates;
+      if (fallback_db_->Lookup(context_query, &fallback_candidates)) {
+        for (const auto& candidate : fallback_candidates) {
+          if (std::find(candidates_.begin(), candidates_.end(), candidate) ==
+              candidates_.end()) {
+            candidates_.push_back(candidate);
+          }
+        }
+      }
+    }
     return true;
   }
   if (fallback_db_ && fallback_db_->Lookup(context_query, &candidates_)) {
@@ -309,6 +323,7 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
   string level_db_name = "predict.userdb";
   string fallback_db_name = "predict.db";
   string db_name;
+  int min_candidates = 3;
   int max_candidates = 0;
   int max_iterations = 0;
   int deleted_record_expire_days = 0;  // 默认 0（永不清理）
@@ -329,6 +344,7 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
       }
     }
     config->GetString("predictor/fallback_db", &fallback_db_name);
+    config->GetInt("predictor/min_candidates", &min_candidates);
     config->GetInt("predictor/max_candidates", &max_candidates);
     config->GetInt("predictor/max_iterations", &max_iterations);
     config->GetInt("predictor/deleted_record_expire_days",
@@ -351,11 +367,13 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
 
   if (level_db && level_db->valid()) {
     return new PredictEngine(level_db, fallback_db, max_iterations,
-                             max_candidates, deleted_record_expire_days);
+                             min_candidates, max_candidates,
+                             deleted_record_expire_days);
   }
   if (fallback_db && fallback_db->valid()) {
     return new PredictEngine(level_db, fallback_db, max_iterations,
-                             max_candidates, deleted_record_expire_days);
+                             min_candidates, max_candidates,
+                             deleted_record_expire_days);
   }
   {
     LOG(ERROR) << "failed to load predict db: " << level_db_name;

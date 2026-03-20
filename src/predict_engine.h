@@ -71,6 +71,7 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   PredictEngine(an<PredictDb> level_db,
                 an<LegacyPredictDb> fallback_db,
                 int max_iterations,
+                int min_candidates,
                 int max_candidates,
                 int deleted_record_expire_days);
   virtual ~PredictEngine();
@@ -81,6 +82,7 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   an<Translation> Translate(const Segment& segment) const;
 
   int max_iterations() const { return max_iterations_; }
+  int min_candidates() const { return min_candidates_; }
   int max_candidates() const { return max_candidates_; }
   int deleted_record_expire_days() const { return deleted_record_expire_days_; }
   const string& query() const { return query_; }
@@ -106,6 +108,7 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   an<PredictDb> level_db_;
   an<LegacyPredictDb> fallback_db_;
   int max_iterations_;              // prediction times limit
+  int min_candidates_;              // minimum candidate count before fallback
   int max_candidates_;              // prediction candidate count limit
   int deleted_record_expire_days_;  // deleted record expire days
   string query_;                    // cache last query

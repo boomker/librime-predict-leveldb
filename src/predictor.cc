@@ -20,7 +20,9 @@ Predictor::Predictor(const Ticket& ticket, an<PredictEngine> predict_engine)
     : Processor(ticket), predict_engine_(predict_engine) {
   if (auto* config = ticket.schema->config()) {
     config->GetString("predictor/trigger", &trigger_prefix_);
-    config->GetString("predictor/cancel_predict", &cancel_predict_);
+    if (!config->GetString("predictor/cancel_key", &cancel_key_)) {
+      config->GetString("predictor/cancel_predict", &cancel_key_);
+    }
   }
 
   auto* context = engine_->context();
@@ -39,6 +41,7 @@ void Predictor::OnAbort(Context* ctx) {
     return;
   }
   predict_engine_->Clear();
+  awaiting_trigger_after_limit_ = false;
   iteration_counter_ = 0;
   if (ctx->IsComposing()) {
     self_updating_ = true;
@@ -62,16 +65,17 @@ ProcessResult Predictor::ProcessKeyEvent(const KeyEvent& key_event) {
   auto keycode = key_event.keycode();
 
   // Check if this is a cancel key (BackSpace, Escape, or configured
-  // cancel_predict)
+  // cancel_key)
   bool is_cancel_key = (keycode == XK_BackSpace || keycode == XK_Escape);
-  if (!is_cancel_key && !cancel_predict_.empty() && keycode > 0x20 &&
+  if (!is_cancel_key && !cancel_key_.empty() && keycode > 0x20 &&
       keycode < 0x7f) {
-    is_cancel_key = (static_cast<char>(keycode) == cancel_predict_[0]);
+    is_cancel_key = (static_cast<char>(keycode) == cancel_key_[0]);
   }
 
   if (is_cancel_key) {
     last_action_ = kDelete;
     predict_engine_->Clear();
+    awaiting_trigger_after_limit_ = false;
     iteration_counter_ = 0;
     if (!ctx->composition().empty() &&
         ctx->composition().back().HasTag("prediction")) {
@@ -82,19 +86,24 @@ ProcessResult Predictor::ProcessKeyEvent(const KeyEvent& key_event) {
     last_action_ = kUnspecified;
   }
 
-  if (!trigger_prefix_.empty() && ctx->get_option("prediction")) {
+  if (awaiting_trigger_after_limit_ && !trigger_prefix_.empty() &&
+      ctx->get_option("prediction")) {
     if (keycode > 0x20 && keycode < 0x7f) {
       string input = ctx->input();
       input += static_cast<char>(keycode);
 
       if (boost::ends_with(input, trigger_prefix_)) {
-        bool prediction_success = false;
+        awaiting_trigger_after_limit_ = false;
         if (ctx->commit_history().empty()) {
-          prediction_success = predict_engine_->Predict(ctx, "$");
-        } else {
-          auto last_commit = ctx->commit_history().back();
-          prediction_success = predict_engine_->Predict(ctx, last_commit.text);
+          return kNoop;
         }
+        auto last_commit = ctx->commit_history().back();
+        if (last_commit.type == "punct" || last_commit.type == "raw" ||
+            last_commit.type == "thru") {
+          return kNoop;
+        }
+        bool prediction_success =
+            predict_engine_->Predict(ctx, last_commit.text);
 
         if (prediction_success) {
           ctx->PushInput(keycode);
@@ -123,6 +132,7 @@ void Predictor::OnDelete(Context* ctx) {
   if (!predict_engine_ || !ctx || !ctx->get_option("prediction")) {
     return;
   }
+  awaiting_trigger_after_limit_ = false;
   if (ctx->commit_history().empty()) {
     predict_engine_->Clear();
     iteration_counter_ = 0;
@@ -146,84 +156,50 @@ void Predictor::OnContextUpdate(Context* ctx) {
     return;
   }
 
-  if (!trigger_prefix_.empty()) {
-    if (!ctx->commit_history().empty()) {
-      auto last_commit = ctx->commit_history().back();
-
-      if (last_commit.type == "punct" || last_commit.type == "raw" ||
-          last_commit.type == "thru") {
-        predict_engine_->Clear();
-        iteration_counter_ = 0;
-        last_action_ = kUnspecified;
-        return;
-      }
-
-      // learn from every normal commit, not just prediction commits
-      if (ctx->commit_history().size() >= 2) {
-        auto pre_last_commit = *std::prev(ctx->commit_history().end(), 2);
-        predict_engine_->UpdatePredict(pre_last_commit.text, last_commit.text,
-                                       false);
-      }
-
-      if (last_commit.type == "prediction") {
-        int max_iterations = predict_engine_->max_iterations();
-
-        last_action_ = kUnspecified;
-
-        if (max_iterations > 0 && iteration_counter_ >= max_iterations) {
-          predict_engine_->Clear();
-          iteration_counter_ = 0;
-          self_updating_ = true;
-          ctx->Clear();
-          self_updating_ = false;
-          return;
-        }
-
-        iteration_counter_++;
-        PredictAndUpdate(ctx, last_commit.text);
-        return;
-      }
-    }
-    last_action_ = kUnspecified;
+  if (ctx->commit_history().empty()) {
+    awaiting_trigger_after_limit_ = false;
+    PredictAndUpdate(ctx, "$");
+    iteration_counter_ = 1;
     return;
   }
 
-  if (trigger_prefix_.empty()) {
-    if (ctx->commit_history().empty()) {
-      PredictAndUpdate(ctx, "$");
-      iteration_counter_ = 1;
-      return;
-    }
-    auto last_commit = ctx->commit_history().back();
-    if (last_commit.type == "punct" || last_commit.type == "raw" ||
-        last_commit.type == "thru") {
-      predict_engine_->Clear();
-      iteration_counter_ = 0;
-      return;
-    }
-    if (ctx->commit_history().size() >= 2) {
-      auto pre_last_commit = *std::prev(ctx->commit_history().end(), 2);
-      predict_engine_->UpdatePredict(pre_last_commit.text, last_commit.text,
-                                     false);
-    }
-    if (last_commit.type == "prediction") {
-      int max_iterations = predict_engine_->max_iterations();
-      if (max_iterations > 0 && iteration_counter_ >= max_iterations) {
-        predict_engine_->Clear();
-        iteration_counter_ = 0;
-        auto* ctx = engine_->context();
-        if (ctx && !ctx->composition().empty() &&
-            ctx->composition().back().HasTag("prediction")) {
-          ctx->Clear();
-        }
-        return;
-      }
-      iteration_counter_++;
-    } else {
-      iteration_counter_ = 1;
-    }
-    PredictAndUpdate(ctx, last_commit.text);
+  auto last_commit = ctx->commit_history().back();
+  if (last_commit.type == "punct" || last_commit.type == "raw" ||
+      last_commit.type == "thru") {
+    predict_engine_->Clear();
+    awaiting_trigger_after_limit_ = false;
+    iteration_counter_ = 0;
+    last_action_ = kUnspecified;
+    return;
   }
+  if (ctx->commit_history().size() >= 2) {
+    auto pre_last_commit = *std::prev(ctx->commit_history().end(), 2);
+    predict_engine_->UpdatePredict(pre_last_commit.text, last_commit.text,
+                                   false);
+  }
+  if (last_commit.type == "prediction") {
+    int max_iterations = predict_engine_->max_iterations();
+    last_action_ = kUnspecified;
+    if (max_iterations > 0 && iteration_counter_ >= max_iterations) {
+      predict_engine_->Clear();
+      awaiting_trigger_after_limit_ = !trigger_prefix_.empty();
+      iteration_counter_ = 0;
+      auto* engine_ctx = engine_->context();
+      if (engine_ctx && !engine_ctx->composition().empty() &&
+          engine_ctx->composition().back().HasTag("prediction")) {
+        engine_ctx->Clear();
+      }
+      return;
+    }
+    awaiting_trigger_after_limit_ = false;
+    iteration_counter_++;
+    PredictAndUpdate(ctx, last_commit.text);
+    return;
+  }
+
+  awaiting_trigger_after_limit_ = false;
+  iteration_counter_ = 1;
+  PredictAndUpdate(ctx, last_commit.text);
 }
 
 void Predictor::PredictAndUpdate(Context* ctx, const string& context_query) {
