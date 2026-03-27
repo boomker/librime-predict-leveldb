@@ -1,6 +1,7 @@
 #ifndef RIME_PREDICTOR_H_
 #define RIME_PREDICTOR_H_
 
+#include <rime/common.h>
 #include <rime/processor.h>
 
 namespace rime {
@@ -31,6 +32,7 @@ class Predictor : public Processor {
   void OnDelete(Context* ctx);
   void OnAbort(Context* ctx);
   void PredictAndUpdate(Context* ctx, const string& context_query);
+  bool continuous_prediction() const { return continuous_prediction_; }
 
   template <typename T = Context>
   void ConnectAbortNotifier(T* context) {
@@ -49,6 +51,7 @@ class Predictor : public Processor {
   int iteration_counter_ = 0;
   string trigger_prefix_;
   string cancel_key_;
+  bool continuous_prediction_ = false;
 
   an<PredictEngine> predict_engine_;
   connection select_connection_;

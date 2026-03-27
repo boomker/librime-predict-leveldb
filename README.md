@@ -54,6 +54,11 @@ predictor:
   trigger: 'jj'
   # 额外的关闭预测菜单按键
   cancel_key: '/'
+  # 是否开启连续预测，仅移动端生效
+  # false: 受 max_iterations 限制
+  # true: 尽可能持续预测，直到没有候选
+  # 默认值为 false
+  continuous_prediction: false
 ```
 
 补充说明：
@@ -64,5 +69,6 @@ predictor:
 - 如果你已有旧版 `predict.db` 数据，可以直接作为 `fallback_db` 使用。
 - `min_candidates` 只在命中用户库时生效；用户库候选会排在前面，只读库中不重复的候选会追加在后面。
 - `trigger` 不再用于手动拉起首轮预测。开启后，仅在自动预测连续达到 `max_iterations` 上限时生效；此时输入该序列会基于最近一次提交结果接续下一轮预测，无需先提交一个普通候选。
+- `continuous_prediction` 仅移动端生效。开启后会忽略 `max_iterations`，尽可能持续预测，直到没有候选可提供；桌面端仍按 `max_iterations` 处理。
 
 4. 重新部署后即可使用。

@@ -55,6 +55,11 @@ predictor:
   trigger: 'jj'
   # Extra key used to close the prediction menu.
   cancel_key: '/'
+  # Whether to enable continuous prediction. Mobile only.
+  # false: obey max_iterations
+  # true: keep predicting until no candidates remain
+  # Default: false
+  continuous_prediction: false
 ```
 
 Notes:
@@ -65,5 +70,6 @@ Notes:
 - Existing legacy `predict.db` data can be reused directly as `fallback_db`.
 - `min_candidates` only applies after a user-db hit; user-db candidates stay first, and non-duplicate fallback candidates are appended after them.
 - `trigger` no longer starts the first prediction round manually. When enabled, it only takes effect after automatic prediction has already hit `max_iterations`; typing the sequence continues the next round from the most recent commit without requiring an intermediate normal commit.
+- `continuous_prediction` only takes effect on mobile platforms. When enabled, it ignores `max_iterations` and keeps predicting until no candidates remain; desktop platforms still obey `max_iterations`.
 
 4. Deploy and use it.
