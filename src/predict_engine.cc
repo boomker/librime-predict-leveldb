@@ -1,9 +1,12 @@
 #include "predict_engine.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <ctime>
 #include <fstream>
+#include <iterator>
+#include <numeric>
 #include <sstream>
 #include <vector>
 #include <utf8.h>
@@ -24,6 +27,7 @@ namespace rime {
 
 static const ResourceType kPredictDbPredictDbResourceType = {"level_predict_db",
                                                              "", ""};
+static const ResourceType kTriggerRuleDbResourceType = {"userdb", "", ""};
 
 // 旧版本的 Prediction 结构（只有 word 和 count）
 struct LegacyPrediction {
@@ -31,6 +35,58 @@ struct LegacyPrediction {
   double count;
   MSGPACK_DEFINE(word, count);
 };
+
+constexpr char kSceneKeyPrefix[] = "__scene__:";
+constexpr char kChainKeyPrefix[] = "__chain__:";
+constexpr char kDefaultScene[] = "general";
+
+static bool ContainsAny(const string& text,
+                        std::initializer_list<const char*> keywords) {
+  for (const char* keyword : keywords) {
+    if (text.find(keyword) != string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static string ToLowerCopy(string text) {
+  std::transform(text.begin(), text.end(), text.begin(),
+                 [](unsigned char ch) { return std::tolower(ch); });
+  return text;
+}
+
+static bool LooksLikeProgramming(const string& text) {
+  string lower = ToLowerCopy(text);
+  if (ContainsAny(lower, {"::",       "->",      "()",      "{}",      "[]",
+                          "#include", "null",    "nullptr", "todo",    "fixme",
+                          "return",   "const ",  "class ",  "struct ", "bool ",
+                          "int ",     "string ", "vector<", "map<",    "if (",
+                          "for (",    "while (", "json",    "api",     "sql",
+                          "http",     "cpp",     "python"})) {
+    return true;
+  }
+  size_t ascii_count = 0;
+  for (unsigned char ch : text) {
+    if (std::isalnum(ch) || ch == '_' || ch == '/' || ch == '.') {
+      ++ascii_count;
+    }
+  }
+  return ascii_count >= 6 && ascii_count * 2 >= text.size();
+}
+
+static bool LooksLikeOffice(const string& text) {
+  return ContainsAny(
+      text, {"会议", "审批", "请查收", "附件", "邮件", "汇报", "方案", "计划",
+             "进度", "排期", "合同", "报表", "客户", "确认一下", "尽快处理",
+             "知悉", "烦请", "辛苦了"});
+}
+
+static bool LooksLikeChat(const string& text) {
+  return ContainsAny(text, {"哈哈", "晚安", "早安", "在吗", "收到啦", "么么哒",
+                            "谢谢你", "想你", "吃饭", "睡觉", "周末", "好呀",
+                            "表情", "开心", "哭", "呀", "呢", "嘛", "吧"});
+}
 
 static bool DecodePredictions(const string& value,
                               std::vector<Prediction>* predict) {
@@ -238,55 +294,69 @@ an<PredictDb> PredictDbManager::GetPredictDb(const path& file_path) {
 
 PredictEngine::PredictEngine(an<PredictDb> level_db,
                              an<LegacyPredictDb> fallback_db,
+                             an<RuleTriggerEngine> rule_engine,
                              int max_iterations,
                              int min_candidates,
                              int max_candidates,
-                             int deleted_record_expire_days)
+                             int deleted_record_expire_days,
+                             bool enable_rule_prediction,
+                             bool enable_scene_learning,
+                             int max_context_commits)
     : level_db_(level_db),
       fallback_db_(fallback_db),
+      rule_engine_(rule_engine),
       max_iterations_(max_iterations),
       min_candidates_(min_candidates),
       max_candidates_(max_candidates),
-      deleted_record_expire_days_(deleted_record_expire_days) {}
+      deleted_record_expire_days_(deleted_record_expire_days),
+      enable_rule_prediction_(enable_rule_prediction),
+      enable_scene_learning_(enable_scene_learning),
+      max_context_commits_(std::max(1, max_context_commits)) {}
 
 PredictEngine::~PredictEngine() {}
 
 bool PredictEngine::Predict(Context* ctx, const string& context_query) {
-  if (!level_db_ && !fallback_db_) {
+  if (!level_db_ && !fallback_db_ && !rule_engine_) {
     return false;
   }
-  if (level_db_ && level_db_->Lookup(context_query)) {
-    query_ = context_query;
-    candidates_ = level_db_->candidates();
-    if (fallback_db_ && min_candidates_ > 0 &&
-        static_cast<int>(candidates_.size()) < min_candidates_) {
-      vector<string> fallback_candidates;
-      if (fallback_db_->Lookup(context_query, &fallback_candidates)) {
-        for (const auto& candidate : fallback_candidates) {
-          if (std::find(candidates_.begin(), candidates_.end(), candidate) ==
-              candidates_.end()) {
-            candidates_.push_back(candidate);
-          }
-        }
+  query_ = context_query;
+  vector<string> merged;
+  set<string> seen;
+
+  if (level_db_) {
+    for (const auto& key : BuildLookupKeys(ctx, context_query)) {
+      vector<string> learned_candidates;
+      if (level_db_->Lookup(key, &learned_candidates)) {
+        AppendCandidates(learned_candidates, &merged, &seen);
       }
     }
-    return true;
   }
-  if (fallback_db_ && fallback_db_->Lookup(context_query, &candidates_)) {
-    query_ = context_query;
-    return true;
-  } else {
+
+  if (enable_rule_prediction_ && rule_engine_) {
+    AppendCandidates(rule_engine_->Match(context_query, DetectScene(ctx)),
+                     &merged, &seen);
+  }
+
+  if (fallback_db_ &&
+      (merged.empty() || (min_candidates_ > 0 &&
+                          static_cast<int>(merged.size()) < min_candidates_))) {
+    vector<string> fallback_candidates;
+    if (fallback_db_->Lookup(context_query, &fallback_candidates)) {
+      AppendCandidates(fallback_candidates, &merged, &seen);
+    }
+  }
+
+  if (merged.empty()) {
     Clear();
     return false;
   }
+  candidates_ = std::move(merged);
+  return true;
 }
 
 void PredictEngine::Clear() {
   VLOG(3) << "PredictEngine::Clear";
   query_.clear();
-  if (level_db_) {
-    level_db_->Clear();
-  }
   vector<string>().swap(candidates_);
 }
 
@@ -315,6 +385,136 @@ an<Translation> PredictEngine::Translate(const Segment& segment) const {
   return translation;
 }
 
+void PredictEngine::UpdatePredict(Context* ctx,
+                                  const string& key,
+                                  const string& word,
+                                  bool todelete) {
+  if (!level_db_) {
+    return;
+  }
+  UpdatePredict(key, word, todelete);
+  if (!enable_scene_learning_ || !ctx) {
+    return;
+  }
+
+  const string scene = DetectScene(ctx);
+  level_db_->UpdatePredict(BuildSceneKey(scene, key), word, todelete);
+
+  if (ctx->commit_history().size() < 3) {
+    return;
+  }
+  const auto last = ctx->commit_history().back();
+  const auto middle = *std::prev(ctx->commit_history().end(), 2);
+  const auto first = *std::prev(ctx->commit_history().end(), 3);
+  if (middle.text != key || last.text != word || !IsContextualRecord(first) ||
+      !IsContextualRecord(middle) || !IsContextualRecord(last)) {
+    return;
+  }
+  vector<string> chain = {first.text, middle.text};
+  const string chain_key = BuildChainKey(chain);
+  level_db_->UpdatePredict(chain_key, word, todelete);
+  level_db_->UpdatePredict(BuildSceneKey(scene, chain_key), word, todelete);
+}
+
+void PredictEngine::AppendCandidates(const vector<string>& source,
+                                     vector<string>* merged,
+                                     set<string>* seen) const {
+  if (!merged || !seen) {
+    return;
+  }
+  for (const auto& candidate : source) {
+    if (candidate.empty() || !seen->insert(candidate).second) {
+      continue;
+    }
+    merged->push_back(candidate);
+  }
+}
+
+vector<string> PredictEngine::BuildLookupKeys(Context* ctx,
+                                              const string& query) const {
+  vector<string> keys;
+  if (query.empty()) {
+    return keys;
+  }
+  const string scene = DetectScene(ctx);
+  vector<string> recent = CollectRecentCommits(ctx, max_context_commits_);
+  if (recent.size() >= 2) {
+    vector<string> chain = {recent[recent.size() - 2], recent.back()};
+    const string chain_key = BuildChainKey(chain);
+    keys.push_back(BuildSceneKey(scene, chain_key));
+    keys.push_back(chain_key);
+  }
+  keys.push_back(BuildSceneKey(scene, query));
+  keys.push_back(query);
+  return keys;
+}
+
+vector<string> PredictEngine::CollectRecentCommits(Context* ctx,
+                                                   size_t limit) const {
+  vector<string> commits;
+  if (!ctx || limit == 0) {
+    return commits;
+  }
+  for (auto it = ctx->commit_history().rbegin();
+       it != ctx->commit_history().rend() && commits.size() < limit; ++it) {
+    if (!IsContextualRecord(*it)) {
+      continue;
+    }
+    commits.push_back(it->text);
+  }
+  std::reverse(commits.begin(), commits.end());
+  return commits;
+}
+
+string PredictEngine::DetectScene(Context* ctx) const {
+  if (!ctx) {
+    return kDefaultScene;
+  }
+  string explicit_scene = ctx->get_property("predict_scene");
+  if (explicit_scene == "chat" || explicit_scene == "office" ||
+      explicit_scene == "programming" || explicit_scene == "general") {
+    return explicit_scene;
+  }
+
+  int programming_score = 0;
+  int office_score = 0;
+  int chat_score = 0;
+  for (const auto& text : CollectRecentCommits(ctx, 6)) {
+    programming_score += LooksLikeProgramming(text) ? 2 : 0;
+    office_score += LooksLikeOffice(text) ? 2 : 0;
+    chat_score += LooksLikeChat(text) ? 2 : 0;
+  }
+  if (ctx->get_option("ascii_mode")) {
+    ++programming_score;
+  }
+  if (programming_score >= office_score && programming_score >= chat_score &&
+      programming_score > 0) {
+    return "programming";
+  }
+  if (office_score >= chat_score && office_score > 0) {
+    return "office";
+  }
+  if (chat_score > 0) {
+    return "chat";
+  }
+  return kDefaultScene;
+}
+
+string PredictEngine::BuildSceneKey(const string& scene,
+                                    const string& query) const {
+  return string(kSceneKeyPrefix) +
+         (scene.empty() ? string(kDefaultScene) : scene) + "|" + query;
+}
+
+string PredictEngine::BuildChainKey(const vector<string>& commits) const {
+  return string(kChainKeyPrefix) + boost::algorithm::join(commits, "\n");
+}
+
+bool PredictEngine::IsContextualRecord(const CommitRecord& record) const {
+  return record.type != "punct" && record.type != "raw" &&
+         record.type != "thru" && !record.text.empty();
+}
+
 PredictEngineComponent::PredictEngineComponent() {}
 
 PredictEngineComponent::~PredictEngineComponent() {}
@@ -322,11 +522,15 @@ PredictEngineComponent::~PredictEngineComponent() {}
 PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
   string level_db_name = "predict.userdb";
   string fallback_db_name = "predict.db";
+  string rules_db_name = "predict_rules.db";
   string db_name;
   int min_candidates = 3;
   int max_candidates = 0;
   int max_iterations = 0;
-  int deleted_record_expire_days = 0;  // 默认 0（永不清理）
+  int deleted_record_expire_days = 0;
+  int max_context_commits = 2;
+  const bool enable_rule_prediction = true;
+  const bool enable_scene_learning = true;
   if (auto* schema = ticket.schema) {
     auto* config = schema->config();
     if (!config->GetString("predictor/predictdb", &level_db_name)) {
@@ -349,6 +553,8 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
     config->GetInt("predictor/max_iterations", &max_iterations);
     config->GetInt("predictor/deleted_record_expire_days",
                    &deleted_record_expire_days);
+    config->GetString("predictor/rules_db", &rules_db_name);
+    config->GetInt("predictor/max_context_commits", &max_context_commits);
   }
 
   the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
@@ -365,15 +571,25 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
         LegacyPredictDbManager::instance().GetPredictDb(fallback_path);
   }
 
+  an<RuleTriggerEngine> rule_engine = New<RuleTriggerEngine>();
+  the<ResourceResolver> trigger_resolver(
+      Service::instance().CreateResourceResolver(kTriggerRuleDbResourceType));
+  rule_engine->LoadFromDB(trigger_resolver->ResolvePath(rules_db_name));
+  if (ticket.schema && ticket.schema->config()) {
+    rule_engine->LoadFromConfig(ticket.schema->config());
+  }
+
   if (level_db && level_db->valid()) {
-    return new PredictEngine(level_db, fallback_db, max_iterations,
+    return new PredictEngine(level_db, fallback_db, rule_engine, max_iterations,
                              min_candidates, max_candidates,
-                             deleted_record_expire_days);
+                             deleted_record_expire_days, enable_rule_prediction,
+                             enable_scene_learning, max_context_commits);
   }
   if (fallback_db && fallback_db->valid()) {
-    return new PredictEngine(level_db, fallback_db, max_iterations,
+    return new PredictEngine(level_db, fallback_db, rule_engine, max_iterations,
                              min_candidates, max_candidates,
-                             deleted_record_expire_days);
+                             deleted_record_expire_days, enable_rule_prediction,
+                             enable_scene_learning, max_context_commits);
   }
   {
     LOG(ERROR) << "failed to load predict db: " << level_db_name;
@@ -384,7 +600,10 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
 
 an<PredictEngine> PredictEngineComponent::GetInstance(const Ticket& ticket) {
   if (Schema* schema = ticket.schema) {
-    auto found = predict_engine_by_schema_id.find(schema->schema_id());
+    std::ostringstream key_builder;
+    key_builder << schema->schema_id() << "@" << ticket.engine;
+    const string engine_key = key_builder.str();
+    auto found = predict_engine_by_schema_id.find(engine_key);
     if (found != predict_engine_by_schema_id.end()) {
       if (auto instance = found->second.lock()) {
         return instance;
@@ -392,7 +611,7 @@ an<PredictEngine> PredictEngineComponent::GetInstance(const Ticket& ticket) {
     }
     an<PredictEngine> new_instance{Create(ticket)};
     if (new_instance) {
-      predict_engine_by_schema_id[schema->schema_id()] = new_instance;
+      predict_engine_by_schema_id[engine_key] = new_instance;
       return new_instance;
     }
   }
@@ -412,31 +631,50 @@ PredictDb::PredictDb(const path& file_path) {
 
 bool PredictDb::Lookup(const string& query) {
   std::shared_lock<std::shared_mutex> lock(rw_mutex_);  // 读锁
-  if (!db_) {
-    return false;
-  }
-  string value;
-  leveldb::Status status = db_->Get(leveldb::ReadOptions(), query, &value);
-  if (!status.ok()) {
-    // LOG(ERROR) << "Error getting value: " << status.ToString();
-    return false;
-  }
-
   std::vector<Prediction> predict;
-  if (!DecodePredictions(value, &predict)) {
+  if (!LookupPredictions(query, &predict)) {
     return false;
   }
-
-  SortPredictions(predict);
-
   Clear();
   for (const auto& entry : predict) {
-    // 过滤掉已删除的记录（commits < 0）
     if (entry.commits < 0) {
       continue;
     }
     candidates_.push_back(entry.word);
   }
+  return true;
+}
+
+bool PredictDb::Lookup(const string& query, vector<string>* candidates) const {
+  if (!candidates) {
+    return false;
+  }
+  candidates->clear();
+  std::vector<Prediction> predict;
+  if (!LookupPredictions(query, &predict)) {
+    return false;
+  }
+  for (const auto& entry : predict) {
+    if (entry.commits < 0) {
+      continue;
+    }
+    candidates->push_back(entry.word);
+  }
+  return !candidates->empty();
+}
+
+bool PredictDb::LookupPredictions(const string& query,
+                                  std::vector<Prediction>* predict) const {
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+  if (!db_ || !predict) {
+    return false;
+  }
+  string value;
+  leveldb::Status status = db_->Get(leveldb::ReadOptions(), query, &value);
+  if (!status.ok() || !DecodePredictions(value, predict)) {
+    return false;
+  }
+  SortPredictions(*predict);
   return true;
 }
 

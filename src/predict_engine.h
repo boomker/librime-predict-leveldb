@@ -2,7 +2,9 @@
 #define RIME_PREDICT_ENGINE_H_
 
 #include "predict_legacy_db.h"
+#include "rule_trigger_engine.h"
 #include <rime/component.h>
+#include <rime/commit_history.h>
 #include <msgpack.hpp>
 #include <leveldb/db.h>
 #include <mutex>
@@ -43,6 +45,9 @@ class PredictDb {
   PredictDb(const path& file_path);
   ~PredictDb() { delete db_; }
   bool Lookup(const string& query);
+  bool Lookup(const string& query, vector<string>* candidates) const;
+  bool LookupPredictions(const string& query,
+                         std::vector<Prediction>* predict) const;
   void Clear() {
     if (db_) {
       vector<string>().swap(candidates_);
@@ -70,10 +75,14 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
  public:
   PredictEngine(an<PredictDb> level_db,
                 an<LegacyPredictDb> fallback_db,
+                an<RuleTriggerEngine> rule_engine,
                 int max_iterations,
                 int min_candidates,
                 int max_candidates,
-                int deleted_record_expire_days);
+                int deleted_record_expire_days,
+                bool enable_rule_prediction,
+                bool enable_scene_learning,
+                int max_context_commits);
   virtual ~PredictEngine();
 
   bool Predict(Context* ctx, const string& context_query);
@@ -95,6 +104,10 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
       level_db_->UpdatePredict(key, word, todelete);
     }
   }
+  void UpdatePredict(Context* ctx,
+                     const string& key,
+                     const string& word,
+                     bool todelete);
 
   bool BackupData(const path& snapshot_file) {
     return level_db_ &&
@@ -105,13 +118,27 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   }
 
  private:
+  void AppendCandidates(const vector<string>& source,
+                        vector<string>* merged,
+                        set<string>* seen) const;
+  vector<string> BuildLookupKeys(Context* ctx, const string& query) const;
+  vector<string> CollectRecentCommits(Context* ctx, size_t limit) const;
+  string DetectScene(Context* ctx) const;
+  string BuildSceneKey(const string& scene, const string& query) const;
+  string BuildChainKey(const vector<string>& commits) const;
+  bool IsContextualRecord(const CommitRecord& record) const;
+
   an<PredictDb> level_db_;
   an<LegacyPredictDb> fallback_db_;
+  an<RuleTriggerEngine> rule_engine_;
   int max_iterations_;              // prediction times limit
   int min_candidates_;              // minimum candidate count before fallback
   int max_candidates_;              // prediction candidate count limit
   int deleted_record_expire_days_;  // deleted record expire days
-  string query_;                    // cache last query
+  bool enable_rule_prediction_;
+  bool enable_scene_learning_;
+  int max_context_commits_;
+  string query_;  // cache last query
   vector<string> candidates_;
 };
 

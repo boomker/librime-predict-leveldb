@@ -16,12 +16,13 @@
 namespace rime {
 
 Predictor::Predictor(const Ticket& ticket, an<PredictEngine> predict_engine)
-    : Processor(ticket), predict_engine_(predict_engine) {
+    : Processor(ticket),
+      predict_engine_(predict_engine),
+      continuous_prediction_(false) {
   if (auto* config = ticket.schema->config()) {
     bool continuous_prediction = false;
     config->GetString("predictor/trigger", &trigger_prefix_);
-    config->GetBool("predictor/continuous_prediction",
-                    &continuous_prediction);
+    config->GetBool("predictor/continuous_prediction", &continuous_prediction);
     continuous_prediction_ = continuous_prediction;
     if (!config->GetString("predictor/cancel_key", &cancel_key_)) {
       config->GetString("predictor/cancel_predict", &cancel_key_);
@@ -147,7 +148,7 @@ void Predictor::OnDelete(Context* ctx) {
     return;
   }
   auto current_hilited = selected_candidate->text();
-  predict_engine_->UpdatePredict(last_commit.text, current_hilited, true);
+  predict_engine_->UpdatePredict(ctx, last_commit.text, current_hilited, true);
   ctx->Clear();
   ctx->update_notifier()(ctx);
 }
@@ -177,7 +178,7 @@ void Predictor::OnContextUpdate(Context* ctx) {
   }
   if (ctx->commit_history().size() >= 2) {
     auto pre_last_commit = *std::prev(ctx->commit_history().end(), 2);
-    predict_engine_->UpdatePredict(pre_last_commit.text, last_commit.text,
+    predict_engine_->UpdatePredict(ctx, pre_last_commit.text, last_commit.text,
                                    false);
   }
   if (last_commit.type == "prediction") {
