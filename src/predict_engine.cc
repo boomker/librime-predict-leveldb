@@ -668,7 +668,7 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
       lookup_keys.emplace_back(BuildSceneKey(scene, context_chain_key), true);
       lookup_keys.emplace_back(context_chain_key, true);
     }
-    lookup_keys.emplace_back(BuildSceneKey(scene, context_query), true);
+    lookup_keys.emplace_back(BuildSceneKey(scene, context_query), false);
     lookup_keys.emplace_back(context_query, false);
 
     for (const auto& lookup_key : lookup_keys) {
@@ -1167,13 +1167,14 @@ void PredictDb::UpdatePredict(const string& key,
 
     if (todelete) {
       // 标记为已删除：将 commits 设为负值（与 schema 级用户词行为一致）
+      // 标记所有匹配的重复记录
       for (auto& entry : predict) {
         if (entry.word == word) {
           entry.commits = std::min(-1, -std::abs(entry.commits));
           entry.dee = 0.0;
           entry.tick = current_tick;
           found = true;
-          break;
+          // 不 break，继续标记所有重复的记录
         }
       }
     } else {
