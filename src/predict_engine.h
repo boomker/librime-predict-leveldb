@@ -48,6 +48,8 @@ class PredictDb {
   bool Lookup(const string& query, vector<string>* candidates) const;
   bool LookupPredictions(const string& query,
                          std::vector<Prediction>* predict) const;
+  // Check whether any non-deleted prediction for a key is recent.
+  bool HasRecentPrediction(const string& query, int max_age_seconds = 1800) const;
   void Clear() {
     if (db_) {
       vector<string>().swap(candidates_);
@@ -63,6 +65,9 @@ class PredictDb {
   // Sync support
   bool Backup(const path& snapshot_file, int deleted_record_expire_days = 0);
   bool Restore(const path& snapshot_file);
+  bool BackupContext(const path& snapshot_file,
+                     int deleted_record_expire_days = 0);
+  bool RestoreContext(const path& snapshot_file);
 
  private:
   leveldb::DB* db_;
@@ -125,7 +130,7 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   vector<string> CollectRecentCommits(Context* ctx, size_t limit) const;
   string DetectScene(Context* ctx) const;
   string BuildSceneKey(const string& scene, const string& query) const;
-  string BuildChainKey(const vector<string>& commits) const;
+  string BuildChainKey(const vector<string>& context_chain) const;
   bool IsContextualRecord(const CommitRecord& record) const;
 
   an<PredictDb> level_db_;

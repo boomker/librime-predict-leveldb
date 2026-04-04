@@ -6,7 +6,11 @@
       "Bash(xargs clang-format:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(make merged-plugins:*)",
+      "Bash(ls -lh build/lib/librime*.dylib)",
+      "Bash(ls -lh build/lib/librime*.a)",
+      "Bash(ls build/include/rime*.h)"
     ]
   }
 }

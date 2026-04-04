@@ -40,6 +40,36 @@ constexpr char kSceneKeyPrefix[] = "__scene__:";
 constexpr char kChainKeyPrefix[] = "__chain__:";
 constexpr char kDefaultScene[] = "general";
 
+enum class ContextSnapshotType {
+  kSceneQuery,
+  kContextChain,
+  kSceneContextChain,
+};
+
+struct ContextSnapshotEntry {
+  ContextSnapshotType type = ContextSnapshotType::kSceneQuery;
+  string scene;
+  string query;
+  vector<string> context_chain;
+  string word;
+  int commits = 0;
+  double dee = 0.0;
+  uint64_t tick = 0;
+  double count = 0.0;
+};
+
+struct RankedLearningCandidate {
+  string word;
+  int commits = 0;
+  uint64_t tick = 0;
+};
+
+static bool ReadDbTextValue(leveldb::DB* db,
+                            const string& key,
+                            const string& fallback,
+                            string* value);
+static void SortPredictions(std::vector<Prediction>& predict);
+
 static bool ContainsAny(const string& text,
                         std::initializer_list<const char*> keywords) {
   for (const char* keyword : keywords) {
@@ -178,6 +208,14 @@ static bool IsChineseCodePoint(uint32_t code_point) {
          (code_point >= 0x30000 && code_point <= 0x3134F);    // CJK Ext G
 }
 
+static bool IsChinesePunctuationCodePoint(uint32_t code_point) {
+  return (code_point >= 0x3000 && code_point <= 0x303F) ||
+         (code_point >= 0xFF01 && code_point <= 0xFF0F) ||
+         (code_point >= 0xFF1A && code_point <= 0xFF20) ||
+         (code_point >= 0xFF3B && code_point <= 0xFF40) ||
+         (code_point >= 0xFF5B && code_point <= 0xFF65);
+}
+
 static bool IsPunctOnly(const string& text) {
   if (text.empty())
     return true;
@@ -205,6 +243,268 @@ static bool IsPunctOnly(const string& text) {
     return false;
   }
 
+  return true;
+}
+
+static bool ContainsContextPunctuationOrDelimiter(const string& text) {
+  if (text.empty() || text.find_first_of("\t\r\n") != string::npos) {
+    return true;
+  }
+
+  const char* p = text.c_str();
+  const char* end = p + text.length();
+  try {
+    while (p < end) {
+      uint32_t code_point = utf8::next(p, end);
+      if ((code_point < 128 &&
+           std::ispunct(static_cast<unsigned char>(code_point))) ||
+          IsChinesePunctuationCodePoint(code_point)) {
+        return true;
+      }
+    }
+  } catch (const utf8::exception&) {
+    return true;
+  }
+  return false;
+}
+
+static bool IsContextSnapshotSafeText(const string& text) {
+  return !text.empty() && !ContainsContextPunctuationOrDelimiter(text);
+}
+
+static bool AreContextSnapshotSafeTexts(const vector<string>& texts) {
+  return std::all_of(texts.begin(), texts.end(), [](const string& text) {
+    return IsContextSnapshotSafeText(text);
+  });
+}
+
+static const char* ContextSnapshotTypeName(ContextSnapshotType type) {
+  switch (type) {
+    case ContextSnapshotType::kSceneQuery:
+      return "scene_query";
+    case ContextSnapshotType::kContextChain:
+      return "context_chain";
+    case ContextSnapshotType::kSceneContextChain:
+      return "scene_context_chain";
+  }
+  return "scene_query";
+}
+
+static bool ParseContextSnapshotType(const string& type,
+                                     ContextSnapshotType* result) {
+  if (!result) {
+    return false;
+  }
+  if (type == "scene_query") {
+    *result = ContextSnapshotType::kSceneQuery;
+    return true;
+  }
+  if (type == "context_chain") {
+    *result = ContextSnapshotType::kContextChain;
+    return true;
+  }
+  if (type == "scene_context_chain") {
+    *result = ContextSnapshotType::kSceneContextChain;
+    return true;
+  }
+  return false;
+}
+
+static bool SplitScenePayload(const string& payload,
+                              string* scene,
+                              string* nested_key) {
+  if (!scene || !nested_key) {
+    return false;
+  }
+  size_t separator = payload.find('|');
+  if (separator == string::npos || separator == 0 ||
+      separator + 1 >= payload.size()) {
+    return false;
+  }
+  *scene = payload.substr(0, separator);
+  *nested_key = payload.substr(separator + 1);
+  return !scene->empty() && !nested_key->empty();
+}
+
+static bool SplitContextChainPayload(const string& payload,
+                                     vector<string>* context_chain) {
+  if (!context_chain || payload.empty()) {
+    return false;
+  }
+  context_chain->clear();
+  boost::split(*context_chain, payload, boost::is_any_of("\n"),
+               boost::token_compress_off);
+  if (context_chain->empty()) {
+    return false;
+  }
+  return std::all_of(context_chain->begin(), context_chain->end(),
+                     [](const string& item) { return !item.empty(); });
+}
+
+static bool ParseContextSnapshotKey(const string& key,
+                                    ContextSnapshotEntry* entry) {
+  if (!entry) {
+    return false;
+  }
+  entry->scene.clear();
+  entry->query.clear();
+  entry->context_chain.clear();
+  if (boost::algorithm::starts_with(key, kSceneKeyPrefix)) {
+    string scene;
+    string nested_key;
+    if (!SplitScenePayload(key.substr(sizeof(kSceneKeyPrefix) - 1), &scene,
+                           &nested_key)) {
+      return false;
+    }
+    entry->scene = scene;
+    if (boost::algorithm::starts_with(nested_key, kChainKeyPrefix)) {
+      entry->type = ContextSnapshotType::kSceneContextChain;
+      return SplitContextChainPayload(
+          nested_key.substr(sizeof(kChainKeyPrefix) - 1),
+          &entry->context_chain);
+    }
+    entry->type = ContextSnapshotType::kSceneQuery;
+    entry->query = nested_key;
+    return true;
+  }
+  if (boost::algorithm::starts_with(key, kChainKeyPrefix)) {
+    entry->type = ContextSnapshotType::kContextChain;
+    return SplitContextChainPayload(key.substr(sizeof(kChainKeyPrefix) - 1),
+                                    &entry->context_chain);
+  }
+  return false;
+}
+
+static bool WriteSnapshotHeader(leveldb::DB* db,
+                                const path& snapshot_file,
+                                const string& title,
+                                std::ofstream* out) {
+  if (!out) {
+    return false;
+  }
+  string db_name = snapshot_file.stem().u8string();
+  string db_type = "userdb";
+  string rime_version = RIME_VERSION;
+  string tick = std::to_string(static_cast<uint64_t>(std::time(nullptr)));
+  string user_id = snapshot_file.parent_path().filename().u8string();
+
+  ReadDbTextValue(db, "\x01/db_name", db_name, &db_name);
+  ReadDbTextValue(db, "\x01/db_type", db_type, &db_type);
+  ReadDbTextValue(db, "\x01/rime_version", rime_version, &rime_version);
+  ReadDbTextValue(db, "\x01/user_id", user_id, &user_id);
+
+  *out << title << "\n";
+  *out << "#@/db_name\t" << db_name << "\n";
+  *out << "#@/db_type\t" << db_type << "\n";
+  *out << "#@/rime_version\t" << rime_version << "\n";
+  *out << "#@/tick\t" << tick << "\n";
+  *out << "#@/user_id\t" << user_id << "\n";
+  return true;
+}
+
+static bool ParsePredictionMetadata(const string& metadata_str,
+                                    int* commits,
+                                    double* dee,
+                                    uint64_t* tick,
+                                    double* count) {
+  if (!commits || !dee || !tick || !count) {
+    return false;
+  }
+  *commits = 0;
+  *dee = 0.0;
+  *tick = 0;
+  *count = 0.0;
+
+  if (metadata_str.find("c=") != string::npos) {
+    vector<string> kv;
+    boost::split(kv, metadata_str, boost::is_any_of(" "));
+    for (const string& k_eq_v : kv) {
+      size_t eq = k_eq_v.find('=');
+      if (eq == string::npos) {
+        continue;
+      }
+      string key = k_eq_v.substr(0, eq);
+      string value = k_eq_v.substr(eq + 1);
+      try {
+        if (key == "c") {
+          *commits = std::stoi(value);
+        } else if (key == "d") {
+          *dee = std::stod(value);
+        } else if (key == "t") {
+          *tick = std::stoull(value);
+        }
+      } catch (...) {
+        LOG(WARNING) << "failed parsing metadata in predict snapshot: "
+                     << k_eq_v;
+      }
+    }
+    *count = *dee;
+    return true;
+  }
+
+  try {
+    *count = std::stod(metadata_str);
+    if (*count < 1.0) {
+      *commits = 1;
+    } else if (*count < 1.5) {
+      *commits = 2;
+    } else if (*count <= 2.0) {
+      *commits = 3;
+    } else {
+      *commits = static_cast<int>(std::ceil(*count));
+    }
+    *dee = *count;
+    *tick = 1;
+    return true;
+  } catch (const std::exception& ex) {
+    LOG(WARNING) << "skipping malformed predict snapshot row: " << ex.what();
+    return false;
+  }
+}
+
+static bool UpsertRestoredPrediction(leveldb::DB* db,
+                                     const string& key,
+                                     const string& word,
+                                     double count,
+                                     int commits,
+                                     double dee,
+                                     uint64_t tick) {
+  if (!db) {
+    return false;
+  }
+  std::vector<Prediction> predict;
+  string value;
+  leveldb::Status status = db->Get(leveldb::ReadOptions(), key, &value);
+  if (status.ok() && !DecodePredictions(value, &predict)) {
+    LOG(WARNING) << "failed to decode existing prediction list for key: " << key
+                 << "; recreating it.";
+    predict.clear();
+  }
+
+  bool found = false;
+  for (auto& p : predict) {
+    if (p.word == word) {
+      p.count = std::max(p.count, count);
+      p.commits = std::max(p.commits, commits);
+      p.dee = std::max(p.dee, dee);
+      p.tick = std::max(p.tick, tick);
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    predict.push_back({word, count, commits, dee, tick});
+  }
+  SortPredictions(predict);
+  msgpack::sbuffer sbuf;
+  msgpack::pack(sbuf, predict);
+  status = db->Put(leveldb::WriteOptions(), key,
+                   leveldb::Slice(sbuf.data(), sbuf.size()));
+  if (!status.ok()) {
+    LOG(ERROR) << "failed writing restored prediction for key '" << key
+               << "': " << status.ToString();
+    return false;
+  }
   return true;
 }
 
@@ -246,6 +546,27 @@ static int RecencyTier(uint64_t tick, uint64_t now) {
   if (age <= 86400)
     return 1;  // 24 hours
   return 0;
+}
+
+static bool IsRecentLearningPrediction(const Prediction& prediction,
+                                       uint64_t now,
+                                       int max_age_seconds) {
+  if (prediction.commits <= 0) {
+    return false;
+  }
+  if (prediction.tick < 1000000000 || prediction.tick > now) {
+    return false;
+  }
+  return now - prediction.tick <= static_cast<uint64_t>(max_age_seconds);
+}
+
+static bool IsBetterRankedLearningCandidate(
+    const RankedLearningCandidate& lhs,
+    const RankedLearningCandidate& rhs) {
+  if (lhs.commits != rhs.commits) {
+    return lhs.commits > rhs.commits;
+  }
+  return lhs.tick > rhs.tick;
 }
 
 static void SortPredictions(std::vector<Prediction>& predict) {
@@ -320,21 +641,117 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
     return false;
   }
   query_ = context_query;
+  vector<string> rule_candidates;
+  vector<string> all_learned_candidates;
+  vector<string> top_contextual_candidates;
   vector<string> merged;
+  set<string> seen_all_learned;
   set<string> seen;
 
+  // Collect rule-based candidates first
+  if (enable_rule_prediction_ && rule_engine_) {
+    rule_candidates = rule_engine_->Match(context_query, DetectScene(ctx));
+  }
+
+  string best_recent_query_candidate;
+  int best_recent_query_commits = -1;
+  uint64_t best_recent_query_tick = 0;
+  std::map<string, RankedLearningCandidate> contextual_candidate_scores;
   if (level_db_) {
-    for (const auto& key : BuildLookupKeys(ctx, context_query)) {
+    const uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+    const string scene = DetectScene(ctx);
+    vector<std::pair<string, bool>> lookup_keys;
+    vector<string> recent = CollectRecentCommits(ctx, max_context_commits_);
+    if (recent.size() >= 2) {
+      vector<string> context_chain = {recent[recent.size() - 2], recent.back()};
+      const string context_chain_key = BuildChainKey(context_chain);
+      lookup_keys.emplace_back(BuildSceneKey(scene, context_chain_key), true);
+      lookup_keys.emplace_back(context_chain_key, true);
+    }
+    lookup_keys.emplace_back(BuildSceneKey(scene, context_query), true);
+    lookup_keys.emplace_back(context_query, false);
+
+    for (const auto& lookup_key : lookup_keys) {
+      const string& key = lookup_key.first;
+      const bool is_contextual = lookup_key.second;
+      std::vector<Prediction> predictions;
+      if (!level_db_->LookupPredictions(key, &predictions)) {
+        continue;
+      }
       vector<string> learned_candidates;
-      if (level_db_->Lookup(key, &learned_candidates)) {
-        AppendCandidates(learned_candidates, &merged, &seen);
+      for (const auto& prediction : predictions) {
+        if (prediction.commits <= 0) {
+          continue;
+        }
+        learned_candidates.push_back(prediction.word);
+      }
+      if (learned_candidates.empty()) {
+        continue;
+      }
+      AppendCandidates(learned_candidates, &all_learned_candidates,
+                       &seen_all_learned);
+
+      if (is_contextual) {
+        for (const auto& prediction : predictions) {
+          if (!IsRecentLearningPrediction(prediction, now, 2 * 3600)) {
+            continue;
+          }
+          RankedLearningCandidate candidate = {
+              prediction.word, prediction.commits, prediction.tick};
+          auto found = contextual_candidate_scores.find(prediction.word);
+          if (found == contextual_candidate_scores.end() ||
+              IsBetterRankedLearningCandidate(candidate, found->second)) {
+            contextual_candidate_scores[prediction.word] = candidate;
+          }
+        }
+        continue;
+      }
+
+      for (const auto& prediction : predictions) {
+        if (!IsRecentLearningPrediction(prediction, now, 1800)) {
+          continue;
+        }
+        if (best_recent_query_candidate.empty() ||
+            prediction.commits > best_recent_query_commits ||
+            (prediction.commits == best_recent_query_commits &&
+             prediction.tick > best_recent_query_tick)) {
+          best_recent_query_candidate = prediction.word;
+          best_recent_query_commits = prediction.commits;
+          best_recent_query_tick = prediction.tick;
+        }
       }
     }
   }
 
-  if (enable_rule_prediction_ && rule_engine_) {
-    AppendCandidates(rule_engine_->Match(context_query, DetectScene(ctx)),
-                     &merged, &seen);
+  if (!contextual_candidate_scores.empty()) {
+    vector<RankedLearningCandidate> ranked_contextual_candidates;
+    ranked_contextual_candidates.reserve(contextual_candidate_scores.size());
+    for (const auto& item : contextual_candidate_scores) {
+      ranked_contextual_candidates.push_back(item.second);
+    }
+    std::sort(ranked_contextual_candidates.begin(),
+              ranked_contextual_candidates.end(),
+              [](const RankedLearningCandidate& lhs,
+                 const RankedLearningCandidate& rhs) {
+                return IsBetterRankedLearningCandidate(lhs, rhs);
+              });
+    const size_t limit =
+        std::min<size_t>(2, ranked_contextual_candidates.size());
+    for (size_t i = 0; i < limit; ++i) {
+      top_contextual_candidates.push_back(ranked_contextual_candidates[i].word);
+    }
+  }
+
+  if (!best_recent_query_candidate.empty()) {
+    vector<string> best_recent_query = {best_recent_query_candidate};
+    AppendCandidates(best_recent_query, &merged, &seen);
+    AppendCandidates(top_contextual_candidates, &merged, &seen);
+    AppendCandidates(rule_candidates, &merged, &seen);
+    AppendCandidates(all_learned_candidates, &merged, &seen);
+  } else {
+    AppendCandidates(top_contextual_candidates, &merged, &seen);
+    AppendCandidates(rule_candidates, &merged, &seen);
+    AppendCandidates(all_learned_candidates, &merged, &seen);
   }
 
   if (fallback_db_ &&
@@ -396,6 +813,9 @@ void PredictEngine::UpdatePredict(Context* ctx,
   if (!enable_scene_learning_ || !ctx) {
     return;
   }
+  if (!IsContextSnapshotSafeText(key) || !IsContextSnapshotSafeText(word)) {
+    return;
+  }
 
   const string scene = DetectScene(ctx);
   level_db_->UpdatePredict(BuildSceneKey(scene, key), word, todelete);
@@ -410,10 +830,11 @@ void PredictEngine::UpdatePredict(Context* ctx,
       !IsContextualRecord(middle) || !IsContextualRecord(last)) {
     return;
   }
-  vector<string> chain = {first.text, middle.text};
-  const string chain_key = BuildChainKey(chain);
-  level_db_->UpdatePredict(chain_key, word, todelete);
-  level_db_->UpdatePredict(BuildSceneKey(scene, chain_key), word, todelete);
+  vector<string> context_chain = {first.text, middle.text};
+  const string context_chain_key = BuildChainKey(context_chain);
+  level_db_->UpdatePredict(context_chain_key, word, todelete);
+  level_db_->UpdatePredict(BuildSceneKey(scene, context_chain_key), word,
+                           todelete);
 }
 
 void PredictEngine::AppendCandidates(const vector<string>& source,
@@ -439,12 +860,14 @@ vector<string> PredictEngine::BuildLookupKeys(Context* ctx,
   const string scene = DetectScene(ctx);
   vector<string> recent = CollectRecentCommits(ctx, max_context_commits_);
   if (recent.size() >= 2) {
-    vector<string> chain = {recent[recent.size() - 2], recent.back()};
-    const string chain_key = BuildChainKey(chain);
-    keys.push_back(BuildSceneKey(scene, chain_key));
-    keys.push_back(chain_key);
+    vector<string> context_chain = {recent[recent.size() - 2], recent.back()};
+    const string context_chain_key = BuildChainKey(context_chain);
+    keys.push_back(BuildSceneKey(scene, context_chain_key));
+    keys.push_back(context_chain_key);
   }
-  keys.push_back(BuildSceneKey(scene, query));
+  if (IsContextSnapshotSafeText(query)) {
+    keys.push_back(BuildSceneKey(scene, query));
+  }
   keys.push_back(query);
   return keys;
 }
@@ -506,13 +929,13 @@ string PredictEngine::BuildSceneKey(const string& scene,
          (scene.empty() ? string(kDefaultScene) : scene) + "|" + query;
 }
 
-string PredictEngine::BuildChainKey(const vector<string>& commits) const {
-  return string(kChainKeyPrefix) + boost::algorithm::join(commits, "\n");
+string PredictEngine::BuildChainKey(const vector<string>& context_chain) const {
+  return string(kChainKeyPrefix) + boost::algorithm::join(context_chain, "\n");
 }
 
 bool PredictEngine::IsContextualRecord(const CommitRecord& record) const {
   return record.type != "punct" && record.type != "raw" &&
-         record.type != "thru" && !record.text.empty();
+         record.type != "thru" && IsContextSnapshotSafeText(record.text);
 }
 
 PredictEngineComponent::PredictEngineComponent() {}
@@ -678,6 +1101,40 @@ bool PredictDb::LookupPredictions(const string& query,
   return true;
 }
 
+bool PredictDb::HasRecentPrediction(const string& query,
+                                    int max_age_seconds) const {
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+  if (!db_) {
+    return false;
+  }
+  string value;
+  leveldb::Status status = db_->Get(leveldb::ReadOptions(), query, &value);
+  if (!status.ok() || value.empty()) {
+    return false;
+  }
+  std::vector<Prediction> predict;
+  if (!DecodePredictions(value, &predict)) {
+    return false;
+  }
+  if (predict.empty()) {
+    return false;
+  }
+  uint64_t now = static_cast<uint64_t>(std::time(nullptr));
+  for (const auto& entry : predict) {
+    if (entry.commits <= 0) {
+      continue;
+    }
+    if (entry.tick < 1000000000 || entry.tick > now) {
+      continue;
+    }
+    uint64_t age = now - entry.tick;
+    if (age <= static_cast<uint64_t>(max_age_seconds)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void PredictDb::UpdatePredict(const string& key,
                               const string& word,
                               bool todelete) {
@@ -716,6 +1173,7 @@ void PredictDb::UpdatePredict(const string& key,
           entry.dee = 0.0;
           entry.tick = current_tick;
           found = true;
+          break;
         }
       }
     } else {
@@ -767,24 +1225,8 @@ bool PredictDb::Backup(const path& snapshot_file,
     return false;
   }
 
-  string db_name = snapshot_file.stem().u8string();
-  string db_type = "userdb";
-  string rime_version = RIME_VERSION;
   uint64_t current_time = static_cast<uint64_t>(std::time(nullptr));
-  string tick = std::to_string(current_time);  // 使用当前时间戳
-  string user_id = snapshot_file.parent_path().filename().u8string();
-
-  ReadDbTextValue(db_, "\x01/db_name", db_name, &db_name);
-  ReadDbTextValue(db_, "\x01/db_type", db_type, &db_type);
-  ReadDbTextValue(db_, "\x01/rime_version", rime_version, &rime_version);
-  ReadDbTextValue(db_, "\x01/user_id", user_id, &user_id);
-
-  out << "# Rime user dictionary\n";
-  out << "#@/db_name\t" << db_name << "\n";
-  out << "#@/db_type\t" << db_type << "\n";
-  out << "#@/rime_version\t" << rime_version << "\n";
-  out << "#@/tick\t" << tick << "\n";
-  out << "#@/user_id\t" << user_id << "\n";
+  WriteSnapshotHeader(db_, snapshot_file, "# Rime user dictionary", &out);
 
   // 用于计算已删除记录的过期时间
   const uint64_t expire_seconds =
@@ -800,6 +1242,10 @@ bool PredictDb::Backup(const path& snapshot_file,
     if (IsPunctOnly(key)) {
       continue;
     }
+    // 排除场景和链式预测数据，只备份用户直接输入学习的数据
+    if (key.find(kSceneKeyPrefix) == 0 || key.find(kChainKeyPrefix) == 0) {
+      continue;
+    }
 
     string value = it->value().ToString();
     std::vector<Prediction> predict;
@@ -813,6 +1259,68 @@ bool PredictDb::Backup(const path& snapshot_file,
         continue;
       }
       out << key << "\t" << p.word << "\tc=" << p.commits << " d=" << p.dee
+          << " t=" << p.tick << "\n";
+    }
+  }
+  delete it;
+  out.close();
+  return true;
+}
+
+bool PredictDb::BackupContext(const path& snapshot_file,
+                              int deleted_record_expire_days) {
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);  // 读锁
+  LOG(INFO) << "backing up predict context db to " << snapshot_file;
+  std::ofstream out(snapshot_file.string());
+  if (!out) {
+    LOG(ERROR) << "failed to open context backup file: " << snapshot_file;
+    return false;
+  }
+
+  uint64_t current_time = static_cast<uint64_t>(std::time(nullptr));
+  WriteSnapshotHeader(db_, snapshot_file, "# Rime predict context dictionary",
+                      &out);
+
+  const uint64_t expire_seconds =
+      static_cast<uint64_t>(deleted_record_expire_days) * 24 * 3600;
+  const bool enable_expire = (deleted_record_expire_days > 0);
+
+  leveldb::Iterator* it = db_->NewIterator(leveldb::ReadOptions());
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    string key = it->key().ToString();
+    ContextSnapshotEntry entry;
+    if (!ParseContextSnapshotKey(key, &entry)) {
+      continue;
+    }
+    if ((!entry.query.empty() && !IsContextSnapshotSafeText(entry.query)) ||
+        !AreContextSnapshotSafeTexts(entry.context_chain)) {
+      continue;
+    }
+
+    string value = it->value().ToString();
+    std::vector<Prediction> predict;
+    if (!DecodePredictions(value, &predict)) {
+      continue;
+    }
+    for (const auto& p : predict) {
+      if (enable_expire && p.commits < 0 && p.tick > 0 &&
+          current_time > p.tick && (current_time - p.tick) >= expire_seconds) {
+        continue;
+      }
+      if (!IsContextSnapshotSafeText(p.word)) {
+        continue;
+      }
+      out << ContextSnapshotTypeName(entry.type);
+      if (!entry.scene.empty()) {
+        out << "\tscene=" << entry.scene;
+      }
+      if (!entry.query.empty()) {
+        out << "\tquery=" << entry.query;
+      }
+      for (const auto& item : entry.context_chain) {
+        out << "\tcontext_chain_item=" << item;
+      }
+      out << "\tword=" << p.word << "\tc=" << p.commits << " d=" << p.dee
           << " t=" << p.tick << "\n";
     }
   }
@@ -864,83 +1372,111 @@ bool PredictDb::Restore(const path& snapshot_file) {
     double dee = 0.0;
     uint64_t tick = 0;
     double count = 0.0;
+    if (!ParsePredictionMetadata(metadata_str, &commits, &dee, &tick, &count)) {
+      continue;
+    }
+    UpsertRestoredPrediction(db_, key, word, count, commits, dee, tick);
+  }
+  in.close();
+  return true;
+}
 
-    if (metadata_str.find("c=") != string::npos) {
-      vector<string> kv;
-      boost::split(kv, metadata_str, boost::is_any_of(" "));
-      for (const string& k_eq_v : kv) {
-        size_t eq = k_eq_v.find('=');
-        if (eq == string::npos)
-          continue;
-        string k(k_eq_v.substr(0, eq));
-        string v(k_eq_v.substr(eq + 1));
-        try {
-          if (k == "c") {
-            commits = std::stoi(v);
-          } else if (k == "d") {
-            dee = std::stod(v);
-          } else if (k == "t") {
-            tick = std::stoull(v);
-          }
-        } catch (...) {
-          LOG(WARNING) << "failed parsing metadata in predict snapshot: "
-                       << k_eq_v;
-        }
-      }
-      count = dee;
-    } else {
-      try {
-        count = std::stod(metadata_str);
-        // 根据旧格式的权重值估算提交次数
-        if (count < 1.0) {
-          commits = 1;
-        } else if (count < 1.5) {
-          commits = 2;
-        } else if (count <= 2.0) {
-          commits = 3;
-        } else {
-          commits = static_cast<int>(std::ceil(count));
-        }
-        dee = count;
-        tick = 1;
-      } catch (const std::exception& ex) {
-        LOG(WARNING) << "skipping malformed predict snapshot row in "
-                     << snapshot_file << ": " << ex.what();
+bool PredictDb::RestoreContext(const path& snapshot_file) {
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);  // 写锁
+  LOG(INFO) << "restoring predict context db from " << snapshot_file;
+  std::ifstream in(snapshot_file.string());
+  if (!in) {
+    LOG(ERROR) << "failed to open context restore file: " << snapshot_file;
+    return false;
+  }
+  string line;
+  std::getline(in, line);
+  line = NormalizeSnapshotHeader(line);
+  if (line != "# Rime predict context dictionary") {
+    LOG(ERROR) << "invalid predict context backup file format";
+    return false;
+  }
+
+  while (std::getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+
+    vector<string> fields;
+    boost::split(fields, line, boost::is_any_of("\t"),
+                 boost::token_compress_off);
+    if (fields.empty()) {
+      continue;
+    }
+
+    ContextSnapshotEntry entry;
+    if (!ParseContextSnapshotType(fields.front(), &entry.type)) {
+      continue;
+    }
+    for (size_t i = 1; i < fields.size(); ++i) {
+      size_t eq = fields[i].find('=');
+      if (eq == string::npos) {
         continue;
       }
-    }
-
-    std::vector<Prediction> predict;
-    string value;
-    leveldb::Status status = db_->Get(leveldb::ReadOptions(), key, &value);
-    if (status.ok() && !DecodePredictions(value, &predict)) {
-      LOG(WARNING) << "failed to decode existing prediction list for key: "
-                   << key << "; recreating it.";
-      predict.clear();
-    }
-    bool found = false;
-    for (auto& p : predict) {
-      if (p.word == word) {
-        p.count = std::max(p.count, count);
-        p.commits = std::max(p.commits, commits);
-        p.dee = std::max(p.dee, dee);
-        p.tick = std::max(p.tick, tick);
-        found = true;
-        break;
+      const string field = fields[i].substr(0, eq);
+      const string value = fields[i].substr(eq + 1);
+      try {
+        if (field == "scene") {
+          entry.scene = value;
+        } else if (field == "query") {
+          entry.query = value;
+        } else if (field == "context_chain_item") {
+          entry.context_chain.push_back(value);
+        } else if (field == "word") {
+          entry.word = value;
+        } else if (field == "c") {
+          entry.commits = std::stoi(value);
+        } else if (field == "d") {
+          entry.dee = std::stod(value);
+        } else if (field == "t") {
+          entry.tick = std::stoull(value);
+        }
+      } catch (...) {
+        LOG(WARNING) << "failed parsing context snapshot field: " << fields[i];
       }
     }
-    if (!found) {
-      predict.push_back({word, count, commits, dee, tick});
+    entry.count = entry.dee;
+    if (!IsContextSnapshotSafeText(entry.word)) {
+      continue;
     }
-    SortPredictions(predict);
-    msgpack::sbuffer sbuf;
-    msgpack::pack(sbuf, predict);
-    status = db_->Put(leveldb::WriteOptions(), key,
-                      leveldb::Slice(sbuf.data(), sbuf.size()));
-    if (!status.ok()) {
-      LOG(ERROR) << "failed writing restored prediction for key '" << key
-                 << "': " << status.ToString();
+
+    string internal_key;
+    switch (entry.type) {
+      case ContextSnapshotType::kSceneQuery:
+        if (entry.scene.empty() || !IsContextSnapshotSafeText(entry.query)) {
+          continue;
+        }
+        internal_key =
+            string(kSceneKeyPrefix) + entry.scene + "|" + entry.query;
+        break;
+      case ContextSnapshotType::kContextChain:
+        if (entry.context_chain.empty() ||
+            !AreContextSnapshotSafeTexts(entry.context_chain)) {
+          continue;
+        }
+        internal_key = string(kChainKeyPrefix) +
+                       boost::algorithm::join(entry.context_chain, "\n");
+        break;
+      case ContextSnapshotType::kSceneContextChain:
+        if (entry.scene.empty() || entry.context_chain.empty() ||
+            !AreContextSnapshotSafeTexts(entry.context_chain)) {
+          continue;
+        }
+        internal_key = string(kSceneKeyPrefix) + entry.scene + "|" +
+                       string(kChainKeyPrefix) +
+                       boost::algorithm::join(entry.context_chain, "\n");
+        break;
     }
+    UpsertRestoredPrediction(db_, internal_key, entry.word, entry.count,
+                             entry.commits, entry.dee, entry.tick);
   }
   in.close();
   return true;

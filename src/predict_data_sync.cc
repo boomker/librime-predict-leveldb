@@ -16,6 +16,14 @@ static const string predict_snapshot_extension = ".txt";
 
 static const ResourceType kPredictDbResourceType = {"level_predict_db", "", ""};
 
+static string GetContextSnapshotFileName(const string& db_name) {
+  if (boost::ends_with(db_name, ".userdb")) {
+    return db_name.substr(0, db_name.size() - 7) + "_context.userdb" +
+           predict_snapshot_extension;
+  }
+  return db_name + "_context" + predict_snapshot_extension;
+}
+
 static string GetUserPredictDbName(Config* config) {
   if (!config) {
     return "predict.userdb";
@@ -98,6 +106,7 @@ static bool SyncPredictDb(Deployer* deployer, const string& db_name) {
     }
   }
   string snapshot_file = db_name + predict_snapshot_extension;
+  string context_snapshot_file = GetContextSnapshotFileName(db_name);
   const int deleted_record_expire_days = GetDeletedRecordExpireDays(db_name);
 
   // 合并旧版快照
@@ -107,6 +116,18 @@ static bool SyncPredictDb(Deployer* deployer, const string& db_name) {
     if (!predict_db->Restore(legacy_snapshot)) {
       LOG(ERROR) << "failed to merge legacy predict snapshot: "
                  << legacy_snapshot;
+      success = false;
+    }
+  }
+
+  path legacy_context_snapshot = sync_dir / context_snapshot_file;
+  if (fs::exists(legacy_context_snapshot) &&
+      fs::is_regular_file(legacy_context_snapshot)) {
+    LOG(INFO) << "merging legacy predict context snapshot: "
+              << legacy_context_snapshot;
+    if (!predict_db->RestoreContext(legacy_context_snapshot)) {
+      LOG(ERROR) << "failed to merge legacy predict context snapshot: "
+                 << legacy_context_snapshot;
       success = false;
     }
   }
@@ -122,6 +143,19 @@ static bool SyncPredictDb(Deployer* deployer, const string& db_name) {
       LOG(INFO) << "merging predict snapshot: " << file_path;
       if (!predict_db->Restore(file_path)) {
         LOG(ERROR) << "failed to merge predict snapshot: " << file_path;
+        failed_count++;
+        success = false;
+      } else {
+        merged_count++;
+      }
+    }
+
+    path context_file_path = path(it->path()) / context_snapshot_file;
+    if (fs::exists(context_file_path) && fs::is_regular_file(context_file_path)) {
+      LOG(INFO) << "merging predict context snapshot: " << context_file_path;
+      if (!predict_db->RestoreContext(context_file_path)) {
+        LOG(ERROR) << "failed to merge predict context snapshot: "
+                   << context_file_path;
         failed_count++;
         success = false;
       } else {
@@ -145,6 +179,15 @@ static bool SyncPredictDb(Deployer* deployer, const string& db_name) {
     success = false;
   } else {
     LOG(INFO) << "backed up to: " << backup_path;
+  }
+
+  path context_backup_path = backup_dir / context_snapshot_file;
+  if (!predict_db->BackupContext(context_backup_path,
+                                 deleted_record_expire_days)) {
+    LOG(ERROR) << "context backup failed: " << context_backup_path;
+    success = false;
+  } else {
+    LOG(INFO) << "backed up context data to: " << context_backup_path;
   }
 
   return success;
