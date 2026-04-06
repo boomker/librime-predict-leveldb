@@ -45,6 +45,10 @@ class RuleTriggerEngine {
   bool LoadFromDB(const path& db_path);
   void LoadFromConfig(Config* config);
 
+  // 匹配规则并返回候选列表
+  // 冲突解决语义：当规则匹配结果中存在与当前 query 完全相同的 candidate 时，
+  // 仅返回这组精确候选；否则返回全部匹配候选。
+  // 这确保用户已输入完整词时，不会建议无关的其他候选。
   vector<string> Match(const string& query, const string& scene) const;
 
  protected:
