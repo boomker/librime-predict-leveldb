@@ -13,6 +13,13 @@ namespace rime {
 
 class Config;
 
+enum class MatchType {
+  Exact = 0,  // 精确匹配 (默认)
+  Prefix,     // 前缀匹配
+  Suffix,     // 后缀匹配
+  Contains    // 包含匹配
+};
+
 struct TriggerRule {
   string trigger;
   int hour_min = -1;
@@ -22,6 +29,12 @@ struct TriggerRule {
   string candidate;
   int priority = 0;
   bool is_user = false;
+
+  // 新增字段
+  MatchType match_type = MatchType::Exact;  // 匹配类型
+  vector<string> scenes;                    // 场景白名单 (空=不限制)
+  string month_day_start;                   // 日期范围开始 "MM-DD" (空=不限制)
+  string month_day_end;                     // 日期范围结束 "MM-DD" (空=不限制)
 };
 
 class RuleTriggerEngine {
@@ -44,6 +57,7 @@ class RuleTriggerEngine {
   set<string> GetTodayTags(const string& scene, const std::tm& now) const;
   bool MatchRule(const TriggerRule& rule,
                  const string& query,
+                 const string& scene,
                  const set<string>& tags,
                  const std::tm& now) const;
 

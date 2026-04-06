@@ -335,6 +335,34 @@ void RuleTriggerEngine::LoadFromConfig(Config* config) {
     int priority = ReadInt(rule_map, "priority", 100);
     string tag = ReadString(rule_map, "tag");
 
+    // 解析新增字段
+    // match_type: exact/prefix/suffix/contains (默认 exact)
+    string match_type_str = ReadString(rule_map, "match_type");
+    MatchType match_type = MatchType::Exact;
+    if (match_type_str == "prefix") {
+      match_type = MatchType::Prefix;
+    } else if (match_type_str == "suffix") {
+      match_type = MatchType::Suffix;
+    } else if (match_type_str == "contains") {
+      match_type = MatchType::Contains;
+    }
+
+    // scenes: 场景白名单 (空=不限制)
+    vector<string> scenes;
+    auto scenes_list = As<ConfigList>(rule_map->Get("scenes"));
+    if (scenes_list) {
+      for (size_t j = 0; j < scenes_list->size(); ++j) {
+        auto value = scenes_list->GetValueAt(j);
+        if (value && !value->str().empty()) {
+          scenes.push_back(value->str());
+        }
+      }
+    }
+
+    // month_day_start/month_day_end: 日期范围 "MM-DD" (空=不限制)
+    string month_day_start = ReadString(rule_map, "month_day_start");
+    string month_day_end = ReadString(rule_map, "month_day_end");
+
     for (const auto& candidate : candidates) {
       TriggerRule rule;
       rule.trigger = trigger;
@@ -345,6 +373,13 @@ void RuleTriggerEngine::LoadFromConfig(Config* config) {
       rule.candidate = candidate;
       rule.priority = priority--;
       rule.is_user = true;
+
+      // 新增字段
+      rule.match_type = match_type;
+      rule.scenes = scenes;
+      rule.month_day_start = month_day_start;
+      rule.month_day_end = month_day_end;
+
       rules_.push_back(std::move(rule));
     }
   }
@@ -369,7 +404,7 @@ vector<string> RuleTriggerEngine::Match(const string& query,
   vector<string> results;
   set<string> seen;
   for (const auto& rule : rules_) {
-    if (!MatchRule(rule, query, tags, now))
+    if (!MatchRule(rule, query, scene, tags, now))
       continue;
     if (!seen.insert(rule.candidate).second)
       continue;
@@ -569,25 +604,113 @@ set<string> RuleTriggerEngine::GetTodayTags(const string& scene,
   return tags;
 }
 
+// 解析 "MM-DD" 格式日期字符串，返回 MMDD 整数，如 "01-15" -> 115
+// 返回 -1 表示解析失败
+int ParseMonthDay(const string& month_day) {
+  if (month_day.empty()) {
+    return -1;
+  }
+  size_t dash_pos = month_day.find('-');
+  if (dash_pos == string::npos) {
+    dash_pos = month_day.find('/');
+  }
+  if (dash_pos == string::npos) {
+    return -1;
+  }
+  try {
+    int month = std::stoi(month_day.substr(0, dash_pos));
+    int day = std::stoi(month_day.substr(dash_pos + 1));
+    if (month < 1 || month > 12 || day < 1 || day > 31) {
+      return -1;
+    }
+    return month * 100 + day;
+  } catch (...) {
+    return -1;
+  }
+}
+
 bool RuleTriggerEngine::MatchRule(const TriggerRule& rule,
                                   const string& query,
+                                  const string& scene,
                                   const set<string>& tags,
                                   const std::tm& now) const {
-  if (rule.trigger != query) {
+  // 1. trigger + match_type 检查 (最基础的字符串匹配)
+  bool match_trigger = false;
+  switch (rule.match_type) {
+    case MatchType::Exact:
+      match_trigger = (rule.trigger == query);
+      break;
+    case MatchType::Prefix:
+      match_trigger =
+          (query.size() >= rule.trigger.size() &&
+           query.compare(0, rule.trigger.size(), rule.trigger) == 0);
+      break;
+    case MatchType::Suffix:
+      match_trigger = (query.size() >= rule.trigger.size() &&
+                       query.compare(query.size() - rule.trigger.size(),
+                                     rule.trigger.size(), rule.trigger) == 0);
+      break;
+    case MatchType::Contains:
+      match_trigger = (query.find(rule.trigger) != string::npos);
+      break;
+  }
+  if (!match_trigger) {
     return false;
   }
+
+  // 2. weekday 检查
   if (rule.weekday >= 0 && rule.weekday != now.tm_wday) {
     return false;
   }
+
+  // 3. hour range 检查
   if (rule.hour_min >= 0 && now.tm_hour < rule.hour_min) {
     return false;
   }
   if (rule.hour_max >= 0 && now.tm_hour >= rule.hour_max) {
     return false;
   }
+
+  // 4. month-day range 检查 (支持跨年范围)
+  if (!rule.month_day_start.empty() && !rule.month_day_end.empty()) {
+    int current_md = now.tm_mon * 100 + now.tm_mday;
+    int start_md = ParseMonthDay(rule.month_day_start);
+    int end_md = ParseMonthDay(rule.month_day_end);
+
+    if (start_md > 0 && end_md > 0) {
+      bool in_range;
+      if (start_md <= end_md) {
+        // 正常范围，如 01-01 到 12-31
+        in_range = (current_md >= start_md && current_md <= end_md);
+      } else {
+        // 跨年范围，如 12-01 到 02-05
+        in_range = (current_md >= start_md || current_md <= end_md);
+      }
+      if (!in_range) {
+        return false;
+      }
+    }
+  }
+
+  // 5. scene allowlist 检查 (scene 是一级概念，直接判断)
+  if (!rule.scenes.empty()) {
+    bool scene_matched = false;
+    for (const auto& allowed : rule.scenes) {
+      if (scene == allowed) {
+        scene_matched = true;
+        break;
+      }
+    }
+    if (!scene_matched) {
+      return false;
+    }
+  }
+
+  // 6. tag 检查
   if (!rule.tag.empty() && tags.find(rule.tag) == tags.end()) {
     return false;
   }
+
   return true;
 }
 
