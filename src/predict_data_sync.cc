@@ -61,7 +61,7 @@ static int GetDeletedRecordExpireDays(const string& db_name) {
         }
 
         int schema_expire_days = 0;
-        config->GetInt("predictor/deleted_record_expire_days",
+        config->GetInt("predictor/garbage_expire_days",
                        &schema_expire_days);
         if (!found) {
           expire_days = schema_expire_days;

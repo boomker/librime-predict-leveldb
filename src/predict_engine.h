@@ -13,6 +13,12 @@
 
 namespace rime {
 
+enum class UserRulePriority {
+  High,  // 用户规则候选始终在最前面
+  Auto,  // 初始在最前面，有新学习项则顶替上去（默认）
+  Low    // 初始在第5候选位置，被选中后逐步向上挪动
+};
+
 struct Prediction {
   std::string word;
   double count;
@@ -88,7 +94,8 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
                 int deleted_record_expire_days,
                 bool enable_rule_prediction,
                 bool enable_scene_learning,
-                int max_context_commits);
+                int max_context_commits,
+                UserRulePriority user_rule_priority);
   virtual ~PredictEngine();
 
   bool Predict(Context* ctx, const string& context_query);
@@ -144,6 +151,7 @@ class PredictEngine : public Class<PredictEngine, const Ticket&> {
   bool enable_rule_prediction_;
   bool enable_scene_learning_;
   int max_context_commits_;
+  UserRulePriority user_rule_priority_;
   string query_;  // cache last query
   vector<string> candidates_;
 };

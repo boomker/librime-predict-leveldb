@@ -16,14 +16,9 @@
 namespace rime {
 
 Predictor::Predictor(const Ticket& ticket, an<PredictEngine> predict_engine)
-    : Processor(ticket),
-      predict_engine_(predict_engine),
-      continuous_prediction_(false) {
+    : Processor(ticket), predict_engine_(predict_engine) {
   if (auto* config = ticket.schema->config()) {
-    bool continuous_prediction = false;
     config->GetString("predictor/trigger", &trigger_prefix_);
-    config->GetBool("predictor/continuous_prediction", &continuous_prediction);
-    continuous_prediction_ = continuous_prediction;
     if (!config->GetString("predictor/cancel_key", &cancel_key_)) {
       config->GetString("predictor/cancel_predict", &cancel_key_);
     }
@@ -184,8 +179,7 @@ void Predictor::OnContextUpdate(Context* ctx) {
   if (last_commit.type == "prediction") {
     int max_iterations = predict_engine_->max_iterations();
     last_action_ = kUnspecified;
-    if (!continuous_prediction_ && max_iterations > 0 &&
-        iteration_counter_ >= max_iterations) {
+    if (max_iterations > 0 && iteration_counter_ >= max_iterations) {
       predict_engine_->Clear();
       awaiting_trigger_after_limit_ = !trigger_prefix_.empty();
       iteration_counter_ = 0;

@@ -622,7 +622,8 @@ PredictEngine::PredictEngine(an<PredictDb> level_db,
                              int deleted_record_expire_days,
                              bool enable_rule_prediction,
                              bool enable_scene_learning,
-                             int max_context_commits)
+                             int max_context_commits,
+                             UserRulePriority user_rule_priority)
     : level_db_(level_db),
       fallback_db_(fallback_db),
       rule_engine_(rule_engine),
@@ -632,7 +633,8 @@ PredictEngine::PredictEngine(an<PredictDb> level_db,
       deleted_record_expire_days_(deleted_record_expire_days),
       enable_rule_prediction_(enable_rule_prediction),
       enable_scene_learning_(enable_scene_learning),
-      max_context_commits_(std::max(1, max_context_commits)) {}
+      max_context_commits_(std::max(1, max_context_commits)),
+      user_rule_priority_(user_rule_priority) {}
 
 PredictEngine::~PredictEngine() {}
 
@@ -642,6 +644,7 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
   }
   query_ = context_query;
   vector<string> rule_candidates;
+  vector<string> user_rule_candidates;
   vector<string> all_learned_candidates;
   vector<string> top_contextual_candidates;
   vector<string> merged;
@@ -650,7 +653,10 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
 
   // Collect rule-based candidates first
   if (enable_rule_prediction_ && rule_engine_) {
-    rule_candidates = rule_engine_->Match(context_query, DetectScene(ctx));
+    const string rule_scene = DetectScene(ctx);
+    user_rule_candidates =
+        rule_engine_->Match(context_query, rule_scene, /*user_only=*/true);
+    rule_candidates = rule_engine_->Match(context_query, rule_scene);
   }
 
   string best_recent_query_candidate;
@@ -747,17 +753,66 @@ bool PredictEngine::Predict(Context* ctx, const string& context_query) {
   const bool has_recent_learning = !best_recent_query_candidate.empty() ||
                                    !top_contextual_candidates.empty();
 
-  if (!has_recent_learning) {
-    AppendCandidates(rule_candidates, &merged, &seen);
-  } else {
-    if (!best_recent_query_candidate.empty()) {
-      vector<string> best_recent_query = {best_recent_query_candidate};
-      AppendCandidates(best_recent_query, &merged, &seen);
+  // 根据 user_rule_priority 决定用户规则候选的位置
+  if (user_rule_priority_ == UserRulePriority::High) {
+    // high：用户规则候选始终在最前面，不受学习项影响
+    AppendCandidates(user_rule_candidates, &merged, &seen);
+    if (!has_recent_learning) {
+      AppendCandidates(rule_candidates, &merged, &seen);
+    } else {
+      if (!best_recent_query_candidate.empty()) {
+        vector<string> best_recent_query = {best_recent_query_candidate};
+        AppendCandidates(best_recent_query, &merged, &seen);
+      }
+      AppendCandidates(top_contextual_candidates, &merged, &seen);
+      AppendCandidates(rule_candidates, &merged, &seen);
     }
-    AppendCandidates(top_contextual_candidates, &merged, &seen);
-    AppendCandidates(rule_candidates, &merged, &seen);
+    AppendCandidates(all_learned_candidates, &merged, &seen);
+  } else if (user_rule_priority_ == UserRulePriority::Auto) {
+    // auto：无新学习项时用户规则在前，有新学习项则学习项顶替到前面
+    if (!has_recent_learning) {
+      AppendCandidates(rule_candidates, &merged, &seen);
+    } else {
+      if (!best_recent_query_candidate.empty()) {
+        vector<string> best_recent_query = {best_recent_query_candidate};
+        AppendCandidates(best_recent_query, &merged, &seen);
+      }
+      AppendCandidates(top_contextual_candidates, &merged, &seen);
+      AppendCandidates(rule_candidates, &merged, &seen);
+    }
+    AppendCandidates(all_learned_candidates, &merged, &seen);
+  } else {
+    // low：先不插入用户规则候选，收集其余候选后插入到第5位（index 4）
+    // 构造排除用户规则候选的 builtin rule 候选集
+    set<string> user_rule_set(user_rule_candidates.begin(),
+                              user_rule_candidates.end());
+    vector<string> builtin_rule_candidates;
+    for (const auto& c : rule_candidates) {
+      if (!user_rule_set.count(c)) {
+        builtin_rule_candidates.push_back(c);
+      }
+    }
+    if (!has_recent_learning) {
+      AppendCandidates(builtin_rule_candidates, &merged, &seen);
+    } else {
+      if (!best_recent_query_candidate.empty()) {
+        vector<string> best_recent_query = {best_recent_query_candidate};
+        AppendCandidates(best_recent_query, &merged, &seen);
+      }
+      AppendCandidates(top_contextual_candidates, &merged, &seen);
+      AppendCandidates(builtin_rule_candidates, &merged, &seen);
+    }
+    AppendCandidates(all_learned_candidates, &merged, &seen);
+    // 将用户规则候选插入到第5候选位置（index 4），重复项跳过
+    static constexpr size_t kLowInsertPos = 4;
+    size_t insert_pos = std::min(kLowInsertPos, merged.size());
+    for (const auto& c : user_rule_candidates) {
+      if (seen.insert(c).second) {
+        merged.insert(merged.begin() + insert_pos, c);
+        ++insert_pos;
+      }
+    }
   }
-  AppendCandidates(all_learned_candidates, &merged, &seen);
 
   if (fallback_db_ &&
       (merged.empty() || (min_candidates_ > 0 &&
@@ -950,7 +1005,7 @@ PredictEngineComponent::~PredictEngineComponent() {}
 PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
   string level_db_name = "predict.userdb";
   string fallback_db_name = "predict.db";
-  string rules_db_name = "predict_rules.db";
+  string rules_db_name = "predict_rule.db";
   string db_name;
   int min_candidates = 3;
   int max_candidates = 0;
@@ -959,6 +1014,7 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
   int max_context_commits = 2;
   const bool enable_rule_prediction = true;
   const bool enable_scene_learning = true;
+  UserRulePriority user_rule_priority = UserRulePriority::Auto;
   if (auto* schema = ticket.schema) {
     auto* config = schema->config();
     if (!config->GetString("predictor/predictdb", &level_db_name)) {
@@ -979,10 +1035,20 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
     config->GetInt("predictor/min_candidates", &min_candidates);
     config->GetInt("predictor/max_candidates", &max_candidates);
     config->GetInt("predictor/max_iterations", &max_iterations);
-    config->GetInt("predictor/deleted_record_expire_days",
+    config->GetInt("predictor/garbage_expire_days",
                    &deleted_record_expire_days);
-    config->GetString("predictor/rules_db", &rules_db_name);
+    config->GetString("predictor/rule_db", &rules_db_name);
     config->GetInt("predictor/max_context_commits", &max_context_commits);
+    string user_rule_priority_str;
+    if (config->GetString("predictor/user_rule_priority",
+                          &user_rule_priority_str)) {
+      if (user_rule_priority_str == "high") {
+        user_rule_priority = UserRulePriority::High;
+      } else if (user_rule_priority_str == "low") {
+        user_rule_priority = UserRulePriority::Low;
+      }
+      // "auto" or unrecognized → keep default Auto
+    }
   }
 
   the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
@@ -1011,13 +1077,15 @@ PredictEngine* PredictEngineComponent::Create(const Ticket& ticket) {
     return new PredictEngine(level_db, fallback_db, rule_engine, max_iterations,
                              min_candidates, max_candidates,
                              deleted_record_expire_days, enable_rule_prediction,
-                             enable_scene_learning, max_context_commits);
+                             enable_scene_learning, max_context_commits,
+                             user_rule_priority);
   }
   if (fallback_db && fallback_db->valid()) {
     return new PredictEngine(level_db, fallback_db, rule_engine, max_iterations,
                              min_candidates, max_candidates,
                              deleted_record_expire_days, enable_rule_prediction,
-                             enable_scene_learning, max_context_commits);
+                             enable_scene_learning, max_context_commits,
+                             user_rule_priority);
   }
   {
     LOG(ERROR) << "failed to load predict db: " << level_db_name;

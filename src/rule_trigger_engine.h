@@ -13,6 +13,7 @@
 namespace rime {
 
 class Config;
+class ConfigList;
 class ConfigMap;
 
 enum class MatchType {
@@ -59,7 +60,10 @@ class RuleTriggerEngine {
   // 冲突解决语义：当规则匹配结果中存在与当前 query 完全相同的 candidate 时，
   // 仅返回这组精确候选；否则返回全部匹配候选。
   // 这确保用户已输入完整词时，不会建议无关的其他候选。
-  vector<string> Match(const string& query, const string& scene) const;
+  // user_only=true 时仅返回用户自定义规则（is_user=true）的候选。
+  vector<string> Match(const string& query,
+                       const string& scene,
+                       bool user_only = false) const;
 
  protected:
   void LoadBuiltinCalendarDefaults();
@@ -75,9 +79,13 @@ class RuleTriggerEngine {
                  const set<string>& tags,
                  const std::tm& now) const;
 
+  // 从 ConfigList 加载规则（供 LoadFromConfig 和 LoadRulesFromFile 共用）
+  void LoadRuleList(const an<ConfigList>& rule_list, const path& rules_root);
+
   // 模板系统
   void RegisterTemplates();
-  vector<TriggerRule> ExpandTemplate(const an<ConfigMap>& template_config) const;
+  vector<TriggerRule> ExpandTemplate(
+      const an<ConfigMap>& template_config) const;
 
   // 内置模板展开器
   // time_greeting: 时间问候模板
@@ -85,14 +93,15 @@ class RuleTriggerEngine {
   //   base_priority: 默认 100，展开后按顺序递减
   //   注意: 不支持跨午夜时间段 (如 22:00->02:00)，需拆成两条
   static vector<TriggerRule> ExpandTimeGreeting(const an<ConfigMap>& config,
-                                                 int base_priority);
+                                                int base_priority);
 
   // holiday_greeting: 节日问候模板
   //   参数: holidays, candidate_template (默认 "{holiday}快乐"), trigger (可选)
   //   base_priority: 默认 100
-  //   trigger 语义: 为空时默认用 holiday 名，非空时对所有 holiday 复用该 trigger
+  //   trigger 语义: 为空时默认用 holiday 名，非空时对所有 holiday 复用该
+  //   trigger
   static vector<TriggerRule> ExpandHolidayGreeting(const an<ConfigMap>& config,
-                                                    int base_priority);
+                                                   int base_priority);
 
   // weekday_reminder: 工作日提醒模板
   //   参数: items (trigger, weekday, candidates)
@@ -100,7 +109,7 @@ class RuleTriggerEngine {
   //   weekday: -1 表示不限制，0-6 表示周日到周六
   //   注意: weekday=-1 可用，但模板主要用途仍是 weekday 约束提醒
   static vector<TriggerRule> ExpandWeekdayReminder(const an<ConfigMap>& config,
-                                                    int base_priority);
+                                                   int base_priority);
 
   map<string, string> solar_terms_;
   map<string, vector<string>> holidays_;

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <rime/config.h>
+#include <rime/resource.h>
+#include <rime/service.h>
 
 namespace rime {
 
@@ -321,14 +323,41 @@ bool RuleTriggerEngine::LoadFromDB(const path& db_path) {
   return true;
 }
 
-void RuleTriggerEngine::LoadFromConfig(Config* config) {
-  if (!config)
-    return;
-  auto rule_list = config->GetList("predict_trigger_rules");
+void RuleTriggerEngine::LoadRuleList(const an<ConfigList>& rule_list,
+                                     const path& rules_root) {
   if (!rule_list)
     return;
 
   for (size_t i = 0; i < rule_list->size(); ++i) {
+    // 检查是否为外部文件引用（字符串条目，如 "my_rules.yaml"）
+    if (auto value = rule_list->GetValueAt(i)) {
+      const string& file_name = value->str();
+      if (!file_name.empty()) {
+        path file_path = rules_root / file_name;
+        Config file_config;
+        if (!file_config.LoadFromFile(file_path)) {
+          LOG(WARNING) << "predict: failed to load trigger rules file: "
+                       << file_path;
+          continue;
+        }
+        // 外部规则文件支持两种格式：
+        // 1. patch: rules/+: 列表（推荐）
+        // 2. 顶层 predict_trigger_rules 列表（旧格式，向后兼容）
+        an<ConfigList> nested_list;
+        if (auto patch_map = file_config.GetMap("patch")) {
+          // key 字面含斜杠，直接用 ConfigMap::Get 不做路径分割
+          nested_list = As<ConfigList>(patch_map->Get("rules/+"));
+        }
+        if (!nested_list) {
+          nested_list = file_config.GetList("predict_trigger_rules");
+        }
+        if (nested_list) {
+          LoadRuleList(nested_list, file_path.parent_path());
+        }
+      }
+      continue;
+    }
+
     auto rule_map = As<ConfigMap>(rule_list->GetAt(i));
     if (!rule_map)
       continue;
@@ -354,8 +383,6 @@ void RuleTriggerEngine::LoadFromConfig(Config* config) {
     int priority = ReadInt(rule_map, "priority", 100);
     string tag = ReadString(rule_map, "tag");
 
-    // 解析新增字段
-    // match_type: exact/prefix/suffix/contains (默认 exact)
     string match_type_str = ReadString(rule_map, "match_type");
     MatchType match_type = MatchType::Exact;
     if (match_type_str == "prefix") {
@@ -366,7 +393,6 @@ void RuleTriggerEngine::LoadFromConfig(Config* config) {
       match_type = MatchType::Contains;
     }
 
-    // scenes: 场景白名单 (空=不限制)
     vector<string> scenes;
     auto scenes_list = As<ConfigList>(rule_map->Get("scenes"));
     if (scenes_list) {
@@ -378,7 +404,6 @@ void RuleTriggerEngine::LoadFromConfig(Config* config) {
       }
     }
 
-    // month_day_start/month_day_end: 日期范围 "MM-DD" (空=不限制)
     string month_day_start = ReadString(rule_map, "month_day_start");
     string month_day_end = ReadString(rule_map, "month_day_end");
 
@@ -392,14 +417,51 @@ void RuleTriggerEngine::LoadFromConfig(Config* config) {
       rule.candidate = candidate;
       rule.priority = priority--;
       rule.is_user = true;
-
-      // 新增字段
       rule.match_type = match_type;
       rule.scenes = scenes;
       rule.month_day_start = month_day_start;
       rule.month_day_end = month_day_end;
-
       rules_.push_back(std::move(rule));
+    }
+  }
+}
+
+void RuleTriggerEngine::LoadFromConfig(Config* config) {
+  if (!config)
+    return;
+
+  path rules_root;
+  the<ResourceResolver> resolver(Service::instance().CreateResourceResolver(
+      {"userdb", "", ""}));
+  rules_root = resolver->ResolvePath("");
+
+  // Try production path first: predictor/predict_trigger_rules (ConfigMap)
+  auto trigger_map = config->GetMap("predictor/predict_trigger_rules");
+  if (!trigger_map) {
+    // Fallback 1: top-level predict_trigger_rules as ConfigMap
+    trigger_map = config->GetMap("predict_trigger_rules");
+  }
+
+  if (trigger_map) {
+    // calendar_data: 日历数据文件（节气/节假日）
+    if (auto cal_value = As<ConfigValue>(trigger_map->Get("calendar_data"))) {
+      const string& cal_file = cal_value->str();
+      if (!cal_file.empty()) {
+        LoadCalendar(rules_root / cal_file);
+      }
+    }
+
+    // rules: 规则列表（字符串文件引用 或 内联规则 map）
+    auto rule_list = As<ConfigList>(trigger_map->Get("rules"));
+    if (rule_list) {
+      LoadRuleList(rule_list, rules_root);
+    }
+  } else {
+    // Fallback 2: top-level predict_trigger_rules as ConfigList directly
+    // (used in unit tests that set rules inline without a wrapping map)
+    auto rule_list = config->GetList("predict_trigger_rules");
+    if (rule_list) {
+      LoadRuleList(rule_list, rules_root);
     }
   }
 
@@ -412,7 +474,8 @@ void RuleTriggerEngine::LoadFromConfig(Config* config) {
 }
 
 vector<string> RuleTriggerEngine::Match(const string& query,
-                                        const string& scene) const {
+                                        const string& scene,
+                                        bool user_only) const {
   if (query.empty() || rules_.empty()) {
     return {};
   }
@@ -426,6 +489,8 @@ vector<string> RuleTriggerEngine::Match(const string& query,
   // First pass: collect all matching candidates
   vector<string> all_candidates;
   for (const auto& rule : rules_) {
+    if (user_only && !rule.is_user)
+      continue;
     if (!MatchRule(rule, query, scene, tags, now))
       continue;
     if (seen.insert(rule.candidate).second) {
